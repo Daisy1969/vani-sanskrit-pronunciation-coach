@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Vani Sanskrit Coach">
+  <rect width="512" height="512" rx="112" fill="#8a2f0d"/>
+  <circle cx="256" cy="220" r="112" fill="#fff8ee"/>
+  <rect x="221" y="102" width="70" height="190" rx="35" fill="#8a2f0d"/>
+  <path d="M172 230v25c0 47 38 85 84 85s84-38 84-85v-25" fill="none" stroke="#8a2f0d" stroke-width="26" stroke-linecap="round"/>
+  <path d="M256 340v62M205 402h102" stroke="#fff8ee" stroke-width="24" stroke-linecap="round"/>
+  <text x="256" y="478" text-anchor="middle" font-family="system-ui,sans-serif" font-size="48" font-weight="700" fill="#fff8ee">VĀṆĪ</text>
+</svg>

@@ -1,0 +1,446 @@
+    if (score > best.score) best = { matched, score, compared: compareLength };
+  }
+  return best;
+}
+
+function scoreTranscript(word, transcript) {
+  const accepted = [word.common, word.iast, word.devanagari, ...(word.accepted || [])].filter(Boolean);
+  const firstPhonetic = firstPhoneticMatch(word, transcript);
+  let best = {
+    score: firstPhonetic.matched ? 50 : 0,
+    rawScore: 0,
+    target: accepted[0] || word.common,
+    firstPhoneticScore: firstPhonetic.score,
+    matchedFromFirstSound: firstPhonetic.matched
+  };
+
+  for (const target of accepted) {
+    const strict = similarity(strictKey(transcript), strictKey(target));
+    const lenient = similarity(lenientKey(transcript), lenientKey(target));
+    const rawScore = Math.round((strict * 0.78 + lenient * 0.22) * 100);
+
+    // Score from the beginning of the spoken attempt. When the recogniser turns a
+    // Sanskrit sound into an English-looking word (for example, "sur..." becoming
+    // "sunrise"), a matching first phonetic unit is still a real attempt.
+    const recognisablePartial = Math.max(strict, lenient) >= 0.30 || firstPhonetic.matched;
+    const score = recognisablePartial && rawScore < 50 ? 50 : rawScore;
+    if (score > best.score || (score === best.score && rawScore > best.rawScore)) {
+      best = {
+        score,
+        rawScore,
+        target,
+        firstPhoneticScore: firstPhonetic.score,
+        matchedFromFirstSound: firstPhonetic.matched
+      };
+    }
+  }
+  return best;
+}
+
+const focusPatterns = {
+  'ā': ['aa'], 'ī': ['ii'], 'ū': ['uu'], 'yā': ['yaa'],
+  'ś': ['sh'], 'ṣṭ': ['sht', 'shtaa'], 'ṅg': ['ng'], 'ñ': ['ny', 'nch'],
+  'ḍ': ['d'], 'ḍḍ': ['dd'], 'bh': ['bh'], 'dh': ['dh'], 'dhv': ['dhv'],
+  'th': ['th'], 'kh': ['kh'], 'ḥ': ['h'], 'dr': ['dr'], 'yo': ['yo'], 'a-u-ṃ': ['aum', 'om']
+};
+
+function getFocusFeedback(word, transcript, score) {
+  if (score >= 90) return 'Excellent match. Repeat once more to make it automatic.';
+  const heard = strictKey(transcript);
+  const missing = (word.focus || []).filter((focus) => {
+    const patterns = focusPatterns[focus] || [strictKey(focus)];
+    return !patterns.some((pattern) => heard.includes(pattern));
+  });
+  if (missing.length) return `Focus on: ${missing.join(', ')}. ${word.tip}`;
+  if (score >= 72) return `Good attempt. Slow down slightly and keep every syllable distinct.`;
+  return `Listen again, say each syllable separately, then join them together. ${word.tip}`;
+}
+
+function renderFeedback(word, transcript, score) {
+  let cssClass = 'low';
+  let title = 'Listen and try again';
+  if (score >= 86) { cssClass = 'good'; title = 'Excellent pronunciation match'; }
+  else if (score >= 72) { cssClass = 'good'; title = 'Good — one more clear repetition'; }
+  else if (score >= 50) { cssClass = 'mid'; title = 'Recognised — keep refining the sounds'; }
+
+  els.feedbackCard.className = `feedback-card ${cssClass}`;
+  els.scoreBadge.textContent = `${score}%`;
+  els.feedbackTitle.textContent = title;
+  els.heardText.textContent = `Heard: “${transcript || 'No clear transcript'}”`;
+  els.focusFeedback.textContent = getFocusFeedback(word, transcript, score);
+}
+
+function recordAttempt(word, score, transcript) {
+  const now = new Date().toISOString();
+  const current = state.progress[word.id] || { best: 0, attempts: 0, scores: [] };
+  current.best = Math.max(current.best || 0, score);
+  current.attempts = (current.attempts || 0) + 1;
+  current.last = now;
+  current.lastTranscript = transcript;
+  current.scores = [...(current.scores || []), score].slice(-20);
+  state.progress[word.id] = current;
+  state.activity.push({ at: now, wordId: word.id, score });
+  saveState();
+  renderStats();
+}
+
+function evaluateTranscript(transcript, options = {}) {
+  const word = currentWord();
+  const cleaned = String(transcript || '').trim();
+  if (!cleaned) {
+    els.feedbackCard.className = 'feedback-card low';
+    els.scoreBadge.textContent = options.voiceDetected ? 'Voice' : '—';
+    els.feedbackTitle.textContent = options.voiceDetected
+      ? 'Your voice was found, but no phonetic text was returned'
+      : 'No speech reached the recogniser';
+    els.heardText.textContent = options.voiceDetected
+      ? 'The recording contains a speech segment. Acoustic Match scanned the saved audio, but this browser could not convert it into phonetic text.'
+      : 'Check the selected microphone and input-level meter, then try again.';
+    els.focusFeedback.textContent = word.tip;
+    return;
+  }
+  const { score } = scoreTranscript(word, cleaned);
+  renderFeedback(word, cleaned, score);
+  recordAttempt(word, score, cleaned);
+}
+
+function renderLivePhoneticFeedback(transcript) {
+  const word = currentWord();
+  const cleaned = String(transcript || '').trim();
+  if (!cleaned) return;
+  const result = scoreTranscript(word, cleaned);
+  state.livePhoneticScore = Math.max(state.livePhoneticScore, result.score);
+  els.feedbackCard.className = `feedback-card ${result.score >= 72 ? 'good' : result.score >= 50 ? 'mid' : 'neutral'}`;
+  els.scoreBadge.textContent = `${result.score}%`;
+  els.feedbackTitle.textContent = 'Listening from your first spoken sound…';
+  els.heardText.textContent = `First phonetic phrase: “${state.firstPhoneticTranscript || cleaned}”`;
+  els.focusFeedback.textContent = result.matchedFromFirstSound
+    ? 'The opening sound matches. Keep speaking the rest of the word clearly.'
+    : 'Keep the first syllable clear and continue through the whole word.';
+}
+
+function getSupportedMimeType() {
+  if (!window.MediaRecorder) return '';
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function buildAudioConstraints() {
+  const constraints = {
+    channelCount: { ideal: 1 },
+    sampleRate: { ideal: 48000 },
+    sampleSize: { ideal: 16 },
+    // Automatic gain can lift birds and room noise between words. The app applies
+    // its own fixed gain after measuring the background level.
+    autoGainControl: { ideal: false },
+    echoCancellation: { ideal: true },
+    noiseSuppression: { ideal: true }
+  };
+  if (state.settings.microphoneDeviceId) {
+    constraints.deviceId = { ideal: state.settings.microphoneDeviceId };
+  }
+  return constraints;
+}
+
+function microphoneLabel(device, index) {
+  if (device?.label) return device.label;
+  return `Microphone ${index + 1}`;
+}
+
+function renderMicrophoneOptions() {
+  if (!els.microphoneSelect) return;
+  const options = ['<option value="">System default microphone</option>'];
+  state.microphoneDevices.forEach((device, index) => {
+    if (!device.deviceId || device.deviceId === 'default') return;
+    options.push(`<option value="${escapeHtml(device.deviceId)}">${escapeHtml(microphoneLabel(device, index))}</option>`);
+  });
+  els.microphoneSelect.innerHTML = options.join('');
+  const exists = state.microphoneDevices.some((device) => device.deviceId === state.settings.microphoneDeviceId);
+  if (state.settings.microphoneDeviceId && !exists) state.settings.microphoneDeviceId = '';
+  els.microphoneSelect.value = state.settings.microphoneDeviceId || '';
+
+  const activeLabel = state.rawMediaStream?.getAudioTracks?.()[0]?.label;
+  const selected = state.microphoneDevices.find((device) => device.deviceId === state.settings.microphoneDeviceId);
+  if (els.inputDeviceText) {
+    els.inputDeviceText.textContent = `Microphone: ${activeLabel || selected?.label || 'system default'}`;
+  }
+}
+
+async function refreshMicrophoneDevices(requestPermission = false) {
+  let permissionStream = null;
+  try {
+    if (requestPermission) {
+      permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    state.microphoneDevices = devices.filter((device) => device.kind === 'audioinput');
+    renderMicrophoneOptions();
+    saveState();
+  } catch (error) {
+    if (requestPermission) {
+      showToast(error?.name === 'NotAllowedError'
+        ? 'Microphone permission was denied.'
+        : `Could not read microphones: ${error?.message || 'unknown error'}`);
+    }
+  } finally {
+    permissionStream?.getTracks().forEach((track) => track.stop());
+  }
+}
+
+function setMeterIdle() {
+  if (els.inputLevelFill) els.inputLevelFill.style.width = '0%';
+  if (els.settingsMicFill) els.settingsMicFill.style.width = '0%';
+  if (els.inputLevelText) els.inputLevelText.textContent = 'Input level: waiting';
+  [...(els.levelBars?.children || [])].forEach((bar) => {
+    bar.style.height = '7px';
+    bar.style.opacity = '.2';
+  });
+}
+
+function levelText(rms) {
+  if (rms <= 0.0025) return 'No signal';
+  if (rms < 0.010) return 'Very low';
+  if (rms < 0.024) return 'Low';
+  if (rms < 0.18) return 'Good';
+  if (rms < 0.38) return 'Strong';
+  return 'Too loud';
+}
+
+function percentile(values, fraction) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * fraction)));
+  return sorted[index];
+}
+
+function voiceFocusEnabled() {
+  return state.settings.voiceFocus !== false;
+}
+
+function setVoiceGate(open, immediate = false) {
+  state.voiceGateOpen = Boolean(open);
+  if (!state.voiceGateNode || !state.audioContext) return;
+  const now = state.audioContext.currentTime;
+  const gain = state.voiceGateNode.gain;
+  gain.cancelScheduledValues(now);
+  if (immediate) {
+    gain.setValueAtTime(open ? 1 : 0.0001, now);
+  } else {
+    gain.setTargetAtTime(open ? 1 : 0.0001, now, open ? 0.008 : 0.035);
+  }
+}
+
+function beginNoiseCalibration() {
+  state.calibratingNoise = true;
+  state.noiseSamples = [];
+  state.noiseFloorRms = 0.003;
+  state.voiceGateThreshold = 0.012;
+  state.voiceCandidateSince = 0;
+  state.vadArmedAt = Number.POSITIVE_INFINITY;
+  state.lastVoiceFrameAt = 0;
+  state.voiceStartedAt = 0;
+  state.silenceSince = 0;
+  state.autoStopRequested = false;
+  setVoiceGate(!voiceFocusEnabled(), true);
+}
+
+function finishNoiseCalibration() {
+  state.calibratingNoise = false;
+  const usefulSamples = state.noiseSamples.filter((sample) => Number.isFinite(sample) && sample >= 0);
+  // The 70th percentile follows steady ambience while ignoring isolated bird chirps.
+  const measured = percentile(usefulSamples, 0.70);
+  state.noiseFloorRms = Math.max(0.0015, measured || 0.003);
+  const separation = Math.pow(10, Number(state.settings.voiceGateDb || 11) / 20);
+  state.voiceGateThreshold = Math.max(0.009, state.noiseFloorRms * separation);
+  state.noiseSamples = [];
+  if (els.audioProcessingStatus) {
+    const floorDb = Math.round(20 * Math.log10(Math.max(state.noiseFloorRms, 0.00001)));
+    const thresholdDb = Math.round(20 * Math.log10(Math.max(state.voiceGateThreshold, 0.00001)));
+    els.audioProcessingStatus.textContent = `Background measured at about ${floorDb} dB. Voice gate opens near ${thresholdDb} dB.`;
+  }
+}
+
+function updateVoiceFocusVAD(rms, now) {
+  const active = state.recording || state.testingMicrophone || state.preparingRecording;
+  if (!active) return;
+
+  if (state.calibratingNoise) {
+    state.noiseSamples.push(rms);
+    return;
+  }
+
+  if (voiceFocusEnabled() && now < state.vadArmedAt) {
+    setVoiceGate(false);
+    return;
+  }
+
+  if (!voiceFocusEnabled()) {
+    if (rms >= 0.012) {
+      state.voiceDetected = true;
+      state.speechOnsetDetected = true;
+      state.lastVoiceFrameAt = now;
+    }
+    setVoiceGate(true);
+    return;
+  }
+
+  const threshold = state.voiceGateThreshold;
+  const releaseThreshold = Math.max(state.noiseFloorRms * 1.55, threshold * 0.52);
+
+  if (!state.speechOnsetDetected) {
+    if (rms >= threshold) {
+      if (!state.voiceCandidateSince) state.voiceCandidateSince = now;
+      const candidateDuration = now - state.voiceCandidateSince;
+      // Open quickly enough to preserve the first consonant, but do not accept the
+      // sound as a human attempt until it remains above the background for 130 ms.
+      if (candidateDuration >= 25) setVoiceGate(true);
+      if (candidateDuration >= 130) {
+        state.voiceDetected = true;
+        state.speechOnsetDetected = true;
+        state.lastVoiceFrameAt = now;
+        state.voiceStartedAt = now;
+        state.silenceSince = 0;
+        if (state.recording) {
+          els.recordStatus.textContent = 'Your near-field voice is detected — keep speaking the word.';
+        }
+      }
+    } else {
+      if (state.voiceCandidateSince && now - state.voiceCandidateSince < 130) setVoiceGate(false);
+      state.voiceCandidateSince = 0;
+      // Before speech begins, adapt slowly to changing outdoor ambience.
+      state.noiseFloorRms = state.noiseFloorRms * 0.985 + rms * 0.015;
+      const separation = Math.pow(10, Number(state.settings.voiceGateDb || 11) / 20);
+      state.voiceGateThreshold = Math.max(0.009, state.noiseFloorRms * separation);
+    }
+    return;
+  }
+
+  if (false && state.recording && state.voiceStartedAt && now - state.voiceStartedAt >= 5000 && !state.autoStopRequested) {
+    state.autoStopRequested = true;
+    setVoiceGate(false);
+    setTimeout(() => {
+      if (state.recording) stopRecording();
+    }, 100);
+    return;
+  }
+
+  if (rms >= releaseThreshold) {
+    state.lastVoiceFrameAt = now;
+    state.silenceSince = 0;
+    setVoiceGate(true);
+    return;
+  }
+
+  if (!state.silenceSince) state.silenceSince = now;
+  if (false && state.recording && !state.autoStopRequested && now - state.silenceSince >= 950) {
+    state.autoStopRequested = true;
+    setVoiceGate(false);
+    setTimeout(() => {
+      if (state.recording) stopRecording();
+    }, 120);
+  }
+}
+
+function startLevelMonitor() {
+  cancelAnimationFrame(state.levelAnimationFrame);
+  if (!state.analyserNode) return;
+  state.levelBuffer = new Float32Array(state.analyserNode.fftSize);
+
+  const update = () => {
+    if (!state.analyserNode) return;
+    state.analyserNode.getFloatTimeDomainData(state.levelBuffer);
+    let sum = 0;
+    for (const sample of state.levelBuffer) sum += sample * sample;
+    const rms = Math.sqrt(sum / state.levelBuffer.length);
+    const now = performance.now();
+
+    if (state.recording || state.testingMicrophone || state.preparingRecording) {
+      state.peakInputLevel = Math.max(state.peakInputLevel, rms);
+      updateVoiceFocusVAD(rms, now);
+    }
+
+    const db = rms > 0 ? 20 * Math.log10(rms) : -100;
+    const visual = Math.min(1, Math.max(0, (db + 62) / 44));
+    const percent = Math.round(visual * 100);
+    const label = levelText(rms);
+    const gateLabel = voiceFocusEnabled()
+      ? state.calibratingNoise
+        ? 'calibrating background'
+        : state.speechOnsetDetected
+          ? 'voice accepted'
+          : rms >= state.voiceGateThreshold
+            ? 'checking voice'
+            : 'background ignored'
+      : label;
+
+    if (els.inputLevelFill) els.inputLevelFill.style.width = `${percent}%`;
+    if (els.settingsMicFill) els.settingsMicFill.style.width = `${percent}%`;
+    if (els.inputLevelText) {
+      els.inputLevelText.textContent = `Input: ${label} • ${gateLabel}${rms ? ` (${Math.round(db)} dB)` : ''}`;
+      els.inputLevelText.dataset.level = label.toLowerCase().replace(/\s+/g, '-');
+    }
+    if (state.testingMicrophone && els.micTestStatus && !state.calibratingNoise) {
+      els.micTestStatus.textContent = state.speechOnsetDetected
+        ? 'Your close voice passed the background filter.'
+        : 'Background is being ignored. Speak close to the earphone microphone.';
+    }
+
+    const bars = [...(els.levelBars?.children || [])];
+    bars.forEach((bar, index) => {
+      const threshold = (index + 1) / bars.length;
+      const activeBar = visual >= threshold * 0.82;
+      bar.style.height = `${7 + Math.min(22, visual * 25 * (0.65 + index / bars.length))}px`;
+      bar.style.opacity = activeBar ? '1' : '.2';
+    });
+
+    state.levelAnimationFrame = requestAnimationFrame(update);
+  };
+  update();
+}
+
+function renderAppliedAudioStatus() {
+  if (!els.audioProcessingStatus) return;
+  const settings = state.appliedAudioSettings || {};
+  const suppression = settings.noiseSuppression === true ? 'on' : settings.noiseSuppression === false ? 'off' : 'not reported';
+  const echo = settings.echoCancellation === true ? 'on' : settings.echoCancellation === false ? 'off' : 'not reported';
+  const agc = settings.autoGainControl === true ? 'on' : settings.autoGainControl === false ? 'off' : 'not reported';
+  els.audioProcessingStatus.textContent = `Browser processing — noise suppression: ${suppression}; echo cancellation: ${echo}; automatic gain: ${agc}.`;
+}
+
+function stopLevelMonitor() {
+  cancelAnimationFrame(state.levelAnimationFrame);
+  state.levelAnimationFrame = null;
+}
+
+async function createAudioPipeline() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  state.rawMediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: buildAudioConstraints()
+  });
+  const rawTrack = state.rawMediaStream.getAudioTracks()[0] || null;
+  state.appliedAudioSettings = rawTrack?.getSettings?.() || {};
+  renderAppliedAudioStatus();
+  await refreshMicrophoneDevices(false);
+  renderMicrophoneOptions();
+
+  if (!AudioContextClass) {
+    state.mediaStream = state.rawMediaStream;
+    state.processedAudioTrack = state.mediaStream.getAudioTracks()[0] || null;
+    return;
+  }
+
+  state.audioContext = new AudioContextClass();
+  await state.audioContext.resume();
+  state.audioSourceNode = state.audioContext.createMediaStreamSource(state.rawMediaStream);
+
+  state.highPassNode = state.audioContext.createBiquadFilter();
+  state.highPassNode.type = 'highpass';
+  state.highPassNode.frequency.value = 95;
+  state.highPassNode.Q.value = 0.7;
+
+  state.lowPassNode = state.audioContext.createBiquadFilter();
+  state.lowPassNode.type = 'lowpass';
+  state.lowPassNode.frequency.value = 6200;
+  state.lowPassNode.Q.value = 0.7;
+
+  state.microphoneGainNode = state.audioContext.createGain();

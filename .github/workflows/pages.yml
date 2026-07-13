@@ -34,8 +34,14 @@ jobs:
           if found != expected:
               raise SystemExit(f'Missing archive parts. Expected {expected}, found {found}')
 
-          encoded = ''.join(p.read_text(encoding='utf-8').strip() for p in parts)
-          Path('/tmp/vani-pages-min.tar.xz').write_bytes(base64.b64decode(encoded, validate=True))
+          output = bytearray()
+          for part in parts:
+              encoded = part.read_text(encoding='utf-8').strip()
+              output.extend(base64.b64decode(encoded, validate=True))
+
+          archive = Path('/tmp/vani-pages-min.tar.xz')
+          archive.write_bytes(output)
+          print(f'Reconstructed {archive} from {len(parts)} parts ({len(output)} bytes)')
           PY
           tar -xJf /tmp/vani-pages-min.tar.xz -C .
 

@@ -1,0 +1,400 @@
+  const envelope = [];
+  const paddedLength = Math.max(frameSize, samples.length);
+  for (let start = 0; start + frameSize <= paddedLength; start += hopSize) {
+    const frame = new Float32Array(frameSize);
+    let rms = 0;
+    for (let i = 0; i < frameSize; i += 1) {
+      const value = samples[start + i] || 0;
+      const window = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (frameSize - 1));
+      frame[i] = value * window;
+      rms += value * value;
+    }
+    envelope.push(Math.log(Math.sqrt(rms / frameSize) + 1e-5));
+    const spectrum = fftPowerSpectrum(frame, fftSize);
+    const logMel = filters.map((filter) => {
+      let energy = 0;
+      for (const [bin, weight] of filter) energy += (spectrum[bin] || 0) * weight;
+      return Math.log(energy + 1e-10);
+    });
+    const mfcc = [];
+    // C0 is omitted so overall loudness does not dominate the pronunciation score.
+    for (let coefficient = 1; coefficient <= 13; coefficient += 1) {
+      let sum = 0;
+      for (let m = 0; m < logMel.length; m += 1) {
+        sum += logMel[m] * Math.cos(Math.PI * coefficient * (m + 0.5) / logMel.length);
+      }
+      mfcc.push(sum);
+    }
+    staticFeatures.push(mfcc);
+  }
+  const features = normaliseFeatureColumns(appendDeltaFeatures(staticFeatures));
+  const envMean = envelope.reduce((a, b) => a + b, 0) / Math.max(1, envelope.length);
+  const envStd = Math.sqrt(envelope.reduce((sum, value) => sum + (value - envMean) ** 2, 0) / Math.max(1, envelope.length) + 1e-4);
+  const normalEnvelope = envelope.map((value) => [(value - envMean) / envStd]);
+  return {
+    features,
+    envelope: normalEnvelope,
+    duration: samples.length / sampleRate,
+    frameCount: features.length
+  };
+}
+
+function vectorDistance(a, b) {
+  const length = Math.min(a.length, b.length);
+  if (!length) return 10;
+  let sum = 0;
+  for (let i = 0; i < length; i += 1) sum += (a[i] - b[i]) ** 2;
+  return Math.sqrt(sum / length);
+}
+
+function dtwDistance(first, second) {
+  const n = first.length;
+  const m = second.length;
+  if (!n || !m) return 10;
+  const band = Math.max(Math.abs(n - m) + 3, Math.ceil(Math.max(n, m) * 0.48));
+  let previous = new Float64Array(m + 1).fill(Infinity);
+  let previousLength = new Uint16Array(m + 1);
+  previous[0] = 0;
+  for (let i = 1; i <= n; i += 1) {
+    const current = new Float64Array(m + 1).fill(Infinity);
+    const currentLength = new Uint16Array(m + 1);
+    const center = Math.round(i * m / n);
+    const start = Math.max(1, center - band);
+    const end = Math.min(m, center + band);
+    for (let j = start; j <= end; j += 1) {
+      const local = vectorDistance(first[i - 1], second[j - 1]);
+      let best = previous[j - 1];
+      let path = previousLength[j - 1];
+      if (previous[j] + 0.035 < best) { best = previous[j] + 0.035; path = previousLength[j]; }
+      if (current[j - 1] + 0.035 < best) { best = current[j - 1] + 0.035; path = currentLength[j - 1]; }
+      current[j] = local + best;
+      currentLength[j] = Math.min(65535, path + 1);
+    }
+    previous = current;
+    previousLength = currentLength;
+  }
+  return previous[m] / Math.max(1, previousLength[m]);
+}
+
+function compareAcousticBuffers(userBuffer, referenceBuffer, scan = {}) {
+  const user = extractAcousticFeatures(userBuffer);
+  const reference = extractAcousticFeatures(referenceBuffer);
+  if (user.features.length < 4 || reference.features.length < 4) {
+    return { score: 0, soundScore: 0, rhythmScore: 0, durationScore: 0, clarityScore: 0, distance: 10 };
+  }
+  const distance = dtwDistance(user.features, reference.features);
+  const rhythmDistance = dtwDistance(user.envelope, reference.envelope);
+  const soundScore = clamp(110 - distance * 43, 0, 100);
+  const rhythmScore = clamp(106 - rhythmDistance * 38, 0, 100);
+  const ratio = user.duration / Math.max(0.1, reference.duration);
+  const outsideComfort = Math.max(0, Math.abs(Math.log(Math.max(0.05, ratio))) - Math.log(1.85));
+  const durationScore = clamp(100 * Math.exp(-outsideComfort * 1.55), 0, 100);
+  const clarityScore = clamp(45 + Number(scan.confidence || 0.45) * 55, 35, 100);
+  let score = Math.round(soundScore * 0.78 + rhythmScore * 0.12 + durationScore * 0.06 + clarityScore * 0.04);
+  // Prevent a clipped fragment from receiving a high score merely because one
+  // syllable resembles part of the reference.
+  if (ratio < 0.42) score = Math.min(score, 42);
+  else if (ratio < 0.62) score = Math.min(score, 60);
+  if (ratio > 3.4) score = Math.min(score, 72);
+  if (distance < 0.12 && ratio > 0.8 && ratio < 1.25) score = Math.max(score, 98);
+  return {
+    score: clamp(score, 0, 100),
+    soundScore: Math.round(soundScore),
+    rhythmScore: Math.round(rhythmScore),
+    durationScore: Math.round(durationScore),
+    clarityScore: Math.round(clarityScore),
+    distance,
+    rhythmDistance,
+    userDuration: user.duration,
+    referenceDuration: reference.duration,
+    durationRatio: ratio
+  };
+}
+
+function acousticFeedback(word, result) {
+  if (result.score >= 90) return 'Excellent match to the reference sound. Repeat once more to make it automatic.';
+  if (result.soundScore + 8 < result.rhythmScore) return `The rhythm is close, but some consonant or vowel sounds differ. ${word.tip}`;
+  if (result.rhythmScore + 10 < result.soundScore) return `The sounds are close. Slow down and keep the syllable timing even. ${word.tip}`;
+  if (result.score >= 72) return `Good pronunciation match. Refine the highlighted sound: ${word.tip}`;
+  if (result.score >= 50) return `The word is recognisable. Listen slowly, copy one syllable at a time, then join it together. ${word.tip}`;
+  return `Listen again and copy the exact vowel lengths and consonant releases. ${word.tip}`;
+}
+
+function renderAcousticFeedback(word, result, scan = {}) {
+  const score = result.score;
+  let cssClass = 'low';
+  let title = 'Listen and try again';
+  if (score >= 88) { cssClass = 'good'; title = 'Excellent acoustic pronunciation match'; }
+  else if (score >= 72) { cssClass = 'good'; title = 'Good pronunciation match'; }
+  else if (score >= 50) { cssClass = 'mid'; title = 'Recognisable — keep refining the sounds'; }
+  els.feedbackCard.className = `feedback-card ${cssClass}`;
+  els.scoreBadge.textContent = `${score}%`;
+  els.feedbackTitle.textContent = title;
+  const selected = Number.isFinite(scan.start) && Number.isFinite(scan.end)
+    ? `Voice found at ${scan.start.toFixed(1)}–${scan.end.toFixed(1)} seconds. `
+    : '';
+  els.heardText.textContent = `${selected}Compared with the reference you heard: sound ${result.soundScore}%, rhythm ${result.rhythmScore}%, clarity ${result.clarityScore}%.`;
+  els.focusFeedback.textContent = acousticFeedback(word, result);
+  recordAttempt(word, score, `Acoustic: sound ${result.soundScore}%, rhythm ${result.rhythmScore}%`);
+}
+
+async function scanRecordingForVoice(blob, referenceBuffer = null) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    return { blob, audioBuffer: null, found: state.voiceDetected, start: 0, end: 0, confidence: 0, error: 'Web Audio is unavailable.' };
+  }
+  let context;
+  try {
+    context = new AudioContextClass();
+    const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+    const generic = findVoiceSegment(decoded);
+    const ranges = [];
+    const addRange = (start, end, genericScore = 0) => {
+      const paddedStart = Math.max(0, start - 0.22);
+      const paddedEnd = Math.min(decoded.duration, end + 0.30);
+      if (paddedEnd - paddedStart < 0.18) return;
+      if (ranges.some((item) => Math.abs(item.start - paddedStart) < 0.08 && Math.abs(item.end - paddedEnd) < 0.12)) return;
+      ranges.push({ start: paddedStart, end: paddedEnd, genericScore });
+    };
+    addRange(generic.start, generic.end, 30);
+    for (const candidate of generic.candidates || []) addRange(candidate.start, candidate.end, candidate.score || 0);
+
+    // The generic voice detector may prefer a loud bird. Compare every plausible
+    // segment with the actual target word and select the closest acoustic match.
+    let best = null;
+    for (const range of ranges.slice(0, 10)) {
+      const buffer = extractNormalisedMonoBuffer(decoded, range.start, range.end);
+      const comparison = referenceBuffer ? compareAcousticBuffers(buffer, referenceBuffer, generic) : null;
+      const selectionScore = comparison ? comparison.score + Math.min(6, range.genericScore / 20) : range.genericScore;
+      if (!best || selectionScore > best.selectionScore) {
+        best = { ...range, buffer, comparison, selectionScore };
+      }
+    }
+
+    if (!best) {
+      const buffer = extractNormalisedMonoBuffer(decoded, generic.start, generic.end);
+      best = { start: generic.start, end: generic.end, buffer, comparison: referenceBuffer ? compareAcousticBuffers(buffer, referenceBuffer, generic) : null };
+    }
+    const trimmedBlob = audioBufferToWavBlob(best.buffer);
+    return {
+      ...generic,
+      found: Boolean(generic.found || (best.comparison?.score || 0) >= 35),
+      start: best.start,
+      end: best.end,
+      blob: trimmedBlob,
+      audioBuffer: best.buffer,
+      acousticPreview: best.comparison,
+      originalDuration: decoded.duration,
+      selectedByAcousticMatch: Boolean(referenceBuffer && ranges.length > 1)
+    };
+  } catch (error) {
+    return { blob, audioBuffer: null, found: state.voiceDetected, start: 0, end: 0, confidence: 0, error: error?.message || 'Could not decode the recording.' };
+  } finally {
+    context?.close?.().catch(() => {});
+  }
+}
+
+function rankTranscriptCandidates(candidates) {
+  const unique = new Map();
+  for (const candidate of candidates) {
+    const transcript = String(candidate?.transcript || candidate || '').trim();
+    if (!transcript) continue;
+    const key = transcript.toLowerCase();
+    const match = scoreTranscript(currentWord(), transcript);
+    const confidence = Number(candidate?.confidence || 0);
+    const rank = match.score * 2.4
+      + match.rawScore * 0.55
+      + match.firstPhoneticScore * 0.40
+      + confidence * 8
+      + Math.min(transcript.length, 35) * 0.04;
+    const entry = { transcript, confidence, rank, score: match.score, source: candidate?.source || 'browser' };
+    const previous = unique.get(key);
+    if (!previous || entry.rank > previous.rank) unique.set(key, entry);
+  }
+  return [...unique.values()].sort((a, b) => b.rank - a.rank);
+}
+
+async function recogniseSavedAudioPass(audioBuffer, language) {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!Recognition || !AudioContextClass || !audioBuffer) {
+    return { supported: false, candidates: [], error: 'Recorded-audio recognition is unavailable.' };
+  }
+
+  let context;
+  let source;
+  let recognition;
+  let finished = false;
+  let timeoutId;
+  const candidates = [];
+
+  const finish = async (result) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeoutId);
+    try { recognition?.abort?.(); } catch { /* already ended */ }
+    try { source?.stop?.(); } catch { /* already ended */ }
+    await context?.close?.().catch(() => {});
+    return result;
+  };
+
+  return new Promise(async (resolve) => {
+    const settle = async (result) => resolve(await finish(result));
+    try {
+      context = new AudioContextClass({ sampleRate: audioBuffer.sampleRate });
+      await context.resume();
+      source = context.createBufferSource();
+      source.buffer = audioBuffer;
+      const destination = context.createMediaStreamDestination();
+      const silentGain = context.createGain();
+      silentGain.gain.value = 0;
+      source.connect(destination);
+      source.connect(silentGain).connect(context.destination);
+      const track = destination.stream.getAudioTracks()[0];
+
+      recognition = new Recognition();
+      recognition.lang = language;
+      recognition.interimResults = true;
+      recognition.continuous = false;
+      recognition.maxAlternatives = 10;
+      applyRecognitionPhrases(recognition);
+
+      recognition.onresult = (event) => {
+        for (const candidate of recognitionCandidates(event)) {
+          candidates.push({ ...candidate, source: `saved-${language}` });
+        }
+      };
+      recognition.onerror = (event) => {
+        if (['aborted', 'no-speech'].includes(event.error)) return;
+        if (event.error === 'audio-capture') state.recordedAudioRecognitionSupported = false;
+      };
+      recognition.onend = () => {
+        state.recordedAudioRecognitionSupported = true;
+        settle({ supported: true, candidates: rankTranscriptCandidates(candidates), language });
+      };
+      source.onended = () => {
+        setTimeout(() => {
+          try { recognition.stop(); } catch { /* already stopped */ }
+        }, 1100);
+      };
+
+      try {
+        recognition.start(track);
+      } catch (error) {
+        state.recordedAudioRecognitionSupported = false;
+        await settle({ supported: false, candidates: [], error: error?.message || 'This Chrome version rejected the saved audio track.' });
+        return;
+      }
+
+      setTimeout(() => {
+        try { source.start(); } catch { /* source already started */ }
+      }, 220);
+      timeoutId = setTimeout(() => {
+        settle({ supported: true, candidates: rankTranscriptCandidates(candidates), language, timeout: true });
+      }, Math.max(5000, audioBuffer.duration * 1000 + 4200));
+    } catch (error) {
+      await settle({ supported: false, candidates: [], error: error?.message || 'Saved-audio recognition failed.' });
+    }
+  });
+}
+
+async function recogniseSavedAudio(audioBuffer) {
+  const languages = [...new Set([
+    state.settings.recognitionLanguage || 'en-IN',
+    'en-IN',
+    'en-US'
+  ])];
+  const all = [];
+  let supported = false;
+  let lastError = '';
+
+  for (let index = 0; index < languages.length; index += 1) {
+    const language = languages[index];
+    els.recordStatus.textContent = `Voice found. Checking the saved pronunciation (${language})…`;
+    const result = await recogniseSavedAudioPass(audioBuffer, language);
+    supported ||= result.supported;
+    lastError = result.error || lastError;
+    all.push(...(result.candidates || []));
+    const ranked = rankTranscriptCandidates(all);
+    // A solid phonetic result does not need more passes. Otherwise try one
+    // alternate language model, and only use the third if nothing was returned.
+    if (ranked[0]?.score >= 62) break;
+    if (index >= 1 && ranked.length) break;
+  }
+  return { supported, candidates: rankTranscriptCandidates(all), error: lastError };
+}
+
+async function handleRecordingStopped() {
+  const peakInput = state.peakInputLevel;
+  const mimeType = state.mediaRecorder?.mimeType || state.mediaChunks[0]?.type || 'audio/webm';
+  const originalBlob = new Blob(state.mediaChunks, { type: mimeType });
+  state.mediaRecorder = null;
+  cleanupAudioPipeline();
+
+  if (!originalBlob.size) {
+    els.recordStatus.textContent = 'The recording was empty. Check the microphone selection and try again.';
+    els.feedbackCard.className = 'feedback-card low';
+    els.feedbackTitle.textContent = 'No recording was captured';
+    return;
+  }
+
+  const word = currentWord();
+  const referenceBuffer = await loadReferenceAudioBuffer(word).catch(() => null);
+  if (!referenceBuffer) {
+    els.recordStatus.textContent = 'No acoustic reference is available for this word.';
+    els.feedbackCard.className = 'feedback-card low';
+    els.feedbackTitle.textContent = 'Reference recording missing';
+    els.heardText.textContent = 'Built-in words include a reference. Custom words need a teacher/reference recording before they can be scored acoustically.';
+    return;
+  }
+
+  els.recordStatus.textContent = 'Searching the complete recording for the voice segment that best matches the target word…';
+  const scan = await scanRecordingForVoice(originalBlob, referenceBuffer);
+  state.lastVoiceScan = scan;
+  const analysisBlob = scan.blob || originalBlob;
+
+  if (state.currentAudioUrl) URL.revokeObjectURL(state.currentAudioUrl);
+  state.currentAudioUrl = URL.createObjectURL(analysisBlob);
+  els.playback.src = state.currentAudioUrl;
+  els.playback.hidden = false;
+
+  if (!scan.audioBuffer) {
+    els.recordStatus.textContent = `The recording could not be decoded for acoustic comparison. Input level: ${levelText(peakInput)}.`;
+    els.feedbackCard.className = 'feedback-card low';
+    els.scoreBadge.textContent = '—';
+    els.feedbackTitle.textContent = 'Could not analyse the recording';
+    els.heardText.textContent = 'Replay it to confirm the microphone worked, then try again.';
+    els.focusFeedback.textContent = word.tip;
+    return;
+  }
+
+  const result = scan.acousticPreview || compareAcousticBuffers(scan.audioBuffer, referenceBuffer, scan);
+  const selector = scan.selectedByAcousticMatch
+    ? 'Acoustic Match checked several sound segments and selected the one closest to the reference.'
+    : 'Acoustic Match located your voice in the saved recording.';
+  els.recordStatus.textContent = `${selector} Input level: ${levelText(peakInput)}. No speech-to-text was used.`;
+  renderAcousticFeedback(word, result, scan);
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function transcribeWithSarvam(blob) {
+  try {
+    const audioBase64 = await blobToBase64(blob);
+    const response = await fetch('/api/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audioBase64, mimeType: blob.type || 'audio/webm' })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Enhanced recognition failed.');
+    els.recordStatus.textContent = 'Enhanced Sanskrit recognition complete.';
+    evaluateTranscript(data.transcript);
+  } catch (error) {

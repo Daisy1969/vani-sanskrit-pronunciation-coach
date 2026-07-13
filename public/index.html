@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#7c2d12">
+  <meta name="description" content="Listen, repeat, record and improve Sanskrit pronunciation using words from the Surya Shakti and Ayur Sampoorna practice sheets.">
+  <title>Vāṇī Sanskrit Pronunciation Coach</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icons/icon.svg">
+  <link rel="stylesheet" href="./styles.css?v=8.0.0">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#practice" aria-label="Vāṇī home">
+        <span class="brand-mark" aria-hidden="true">अ</span>
+        <span>
+          <strong>Vāṇī</strong>
+          <small>Sanskrit Pronunciation Coach • v8 Natural Voices</small>
+        </span>
+      </a>
+      <button class="icon-button" id="installButton" hidden aria-label="Install application" title="Install application">＋</button>
+    </header>
+
+    <nav class="main-nav" aria-label="Application sections">
+      <button class="nav-button active" data-view="practice"><span>🎙️</span>Practice</button>
+      <button class="nav-button" data-view="sequence"><span>☀️</span>Sequence</button>
+      <button class="nav-button" data-view="library"><span>📚</span>Words</button>
+      <button class="nav-button" data-view="progress"><span>📈</span>Progress</button>
+      <button class="nav-button" data-view="settings"><span>⚙️</span>Settings</button>
+    </nav>
+
+    <main>
+      <section id="practice" class="view active" aria-labelledby="practiceTitle">
+        <div class="hero-panel">
+          <div>
+            <p class="eyebrow">Listen → repeat → compare → improve</p>
+            <h1 id="practiceTitle">Learn one Sanskrit sound at a time</h1>
+            <p>Hear the reference, record yourself, then Acoustic Match searches the complete recording and scores how closely your sound matches what you heard.</p>
+          </div>
+          <div class="daily-ring" aria-label="Daily practice goal">
+            <strong id="dailyCount">0</strong>
+            <span>/ 5 today</span>
+          </div>
+        </div>
+
+        <div class="stats-grid" id="quickStats"></div>
+
+        <div class="practice-layout">
+          <article class="practice-card" aria-live="polite">
+            <div class="card-toolbar">
+              <label>
+                Lesson
+                <select id="lessonSelect"></select>
+              </label>
+              <button class="text-button" id="shuffleButton">Shuffle</button>
+            </div>
+
+            <div class="word-stage">
+              <p class="word-number" id="wordCounter"></p>
+              <div class="devanagari" id="wordDevanagari" lang="sa"></div>
+              <h2 id="wordIast"></h2>
+              <p class="common-spelling" id="wordCommon"></p>
+              <p class="meaning" id="wordMeaning"></p>
+              <div class="syllable-row" id="syllableRow"></div>
+            </div>
+
+            <div class="listen-row">
+              <button class="primary-button" id="listenButton">🔊 Hear word</button>
+              <button class="secondary-button" id="slowButton">🐢 Hear slowly</button>
+            </div>
+
+            <div class="record-panel" id="recordPanel">
+              <button class="record-button" id="recordButton" aria-pressed="false">
+                <span class="mic-icon">🎙️</span>
+                <span id="recordLabel">Speak now</span>
+              </button>
+              <p id="recordStatus">Allow microphone access when asked.</p>
+              <p class="input-device" id="inputDeviceText">Microphone: system default</p>
+              <div class="input-meter" aria-label="Live microphone level">
+                <span id="inputLevelFill"></span>
+              </div>
+              <p class="input-level-text" id="inputLevelText">Input level: waiting</p>
+              <div class="level-bars" id="levelBars" aria-hidden="true">
+                <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+              </div>
+            </div>
+
+            <audio id="playback" controls hidden></audio>
+
+            <div class="feedback-card neutral" id="feedbackCard">
+              <div class="score-badge" id="scoreBadge">—</div>
+              <div>
+                <h3 id="feedbackTitle">Your feedback will appear here</h3>
+                <p id="heardText">Tap “Speak now” and say the word.</p>
+                <p class="focus-feedback" id="focusFeedback"></p>
+              </div>
+            </div>
+
+            <div class="word-tip">
+              <strong>Pronunciation cue</strong>
+              <p id="wordTip"></p>
+            </div>
+
+            <div class="navigation-row">
+              <button class="secondary-button" id="previousButton">← Previous</button>
+              <button class="primary-button" id="nextButton">Next word →</button>
+            </div>
+          </article>
+
+          <aside class="side-panel">
+            <section class="mini-card">
+              <h3>Practice method</h3>
+              <ol class="compact-steps">
+                <li>Listen at normal speed.</li>
+                <li>Listen slowly and read the syllables.</li>
+                <li>Record one clear attempt.</li>
+                <li>Repeat until the score improves.</li>
+              </ol>
+            </section>
+            <section class="mini-card">
+              <h3>Scoring method</h3>
+              <p id="engineSummary">Acoustic Match compares the sound itself—no transcription required.</p>
+              <button class="text-button" data-go-settings>Audio settings</button>
+            </section>
+            <section class="mini-card warning-card">
+              <h3>Important</h3>
+              <p>The score compares acoustic patterns with the reference recording. It is a strong practice guide, but a teacher can still hear details that a browser cannot.</p>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <section id="sequence" class="view" aria-labelledby="sequenceTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">From the uploaded Surya Shakti sheet</p>
+            <h1 id="sequenceTitle">18-name sequence practice</h1>
+            <p>Move through the sequence in order. Repeated postures stay repeated so you learn the spoken flow.</p>
+          </div>
+          <button class="secondary-button" id="restartSequence">Restart sequence</button>
+        </div>
+
+        <div class="sequence-progress"><span id="sequenceProgressBar"></span></div>
+        <div class="sequence-grid" id="sequenceGrid"></div>
+
+        <article class="sequence-player">
+          <div>
+            <p class="word-number" id="sequenceCounter"></p>
+            <div class="devanagari compact" id="sequenceDevanagari" lang="sa"></div>
+            <h2 id="sequenceIast"></h2>
+            <p id="sequenceSyllables"></p>
+          </div>
+          <div class="sequence-actions">
+            <button class="secondary-button" id="sequenceListen">🔊 Hear</button>
+            <button class="secondary-button" id="sequenceBack">← Back</button>
+            <button class="primary-button" id="sequenceNext">Next →</button>
+          </div>
+        </article>
+      </section>
+
+      <section id="library" class="view" aria-labelledby="libraryTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Vocabulary from your practice sheets</p>
+            <h1 id="libraryTitle">Word library</h1>
+            <p>Search by English spelling, IAST transliteration, Devanagari, lesson or meaning.</p>
+          </div>
+          <button class="primary-button" id="addWordButton">＋ Add your word</button>
+        </div>
+
+        <div class="filter-bar">
+          <input id="librarySearch" type="search" placeholder="Search words…" aria-label="Search word library">
+          <select id="libraryLesson" aria-label="Filter by lesson"></select>
+        </div>
+        <div class="word-library" id="wordLibrary"></div>
+      </section>
+
+      <section id="progress" class="view" aria-labelledby="progressTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Stored only in this browser</p>
+            <h1 id="progressTitle">Your progress</h1>
+            <p>Best scores, attempts and practice history are saved locally on this device.</p>
+          </div>
+          <button class="secondary-button" id="exportButton">Export progress</button>
+        </div>
+
+        <div class="stats-grid large" id="progressStats"></div>
+        <div class="progress-table-wrap">
+          <table>
+            <thead>
+              <tr><th>Word</th><th>Best</th><th>Attempts</th><th>Last practised</th><th>Status</th></tr>
+            </thead>
+            <tbody id="progressTable"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="settings" class="view" aria-labelledby="settingsTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Microphone, voice and data</p>
+            <h1 id="settingsTitle">Settings</h1>
+            <p>Adjust the microphone, reference volume and speaking speed that work for you.</p>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <section class="settings-card audio-setup-card">
+            <h2>Microphone and playback</h2>
+            <label>
+              Microphone
+              <select id="microphoneSelect">
+                <option value="">System default microphone</option>
+              </select>
+            </label>
+            <button class="secondary-button" id="refreshMicrophonesButton">Refresh microphone list</button>
+
+            <label>
+              Microphone boost <output id="micGainOutput">1.75×</output>
+              <input id="micGainSlider" type="range" min="1" max="4" step="0.25" value="1.75">
+            </label>
+
+            <label>
+              Recorded voice playback boost <output id="playbackGainOutput">1.60×</output>
+              <input id="playbackGainSlider" type="range" min="1" max="3" step="0.10" value="1.60">
+            </label>
+
+            <label class="toggle-card">
+              <input id="earphoneMode" type="checkbox" checked>
+              <span>
+                <strong>Voice Focus — ignore birds and background</strong>
+                <small>Measures the background for live guidance, saves the whole attempt, then searches the complete recording and chooses the segment that most closely matches the target word.</small>
+              </span>
+            </label>
+
+            <label>
+              Background rejection <output id="voiceGateOutput">11 dB</output>
+              <input id="voiceGateSlider" type="range" min="6" max="20" step="1" value="11">
+              <small class="help-text">Raise this when birds still trigger recording. Lower it when your voice is not opening the gate.</small>
+            </label>
+
+            <p class="status-line" id="audioProcessingStatus">Voice Focus will check the browser microphone processing when the microphone starts.</p>
+            <button class="primary-button" id="testMicrophone">Test microphone</button>
+            <div class="settings-mic-meter" aria-label="Microphone test level"><span id="settingsMicFill"></span></div>
+            <p class="status-line" id="micTestStatus">Choose your earphones, then run a 10-second microphone test.</p>
+          </section>
+
+          <section class="settings-card">
+            <h2>Pronunciation scoring</h2>
+            <p><strong>Acoustic Match</strong> compares the voice recording directly with the reference audio using sound-spectrum and timing features.</p>
+            <p class="status-line">Chrome does not need to produce phonetic text. Background sounds are treated as candidate segments, and the segment closest to the target word is selected.</p>
+          </section>
+
+          <section class="settings-card">
+            <h2>Reference audio</h2>
+            <label>
+              Natural reference voice
+              <select id="referenceVoiceGender">
+                <option value="female">Female</option>
+                <option value="male">Male</option>
+              </select>
+              <small class="help-text" id="referenceVoiceStatus">The app will use the most natural matching voice installed on this Mac.</small>
+            </label>
+            <label hidden>
+              Fallback system voice
+              <select id="voiceSelect"></select>
+            </label>
+            <label>
+              Normal speed <output id="rateOutput">0.82×</output>
+              <input id="rateSlider" type="range" min="0.5" max="1.15" step="0.05" value="0.82">
+            </label>
+            <label>
+              Reference volume <output id="referenceGainOutput">1.55×</output>
+              <input id="referenceGainSlider" type="range" min="0.75" max="3" step="0.05" value="1.55">
+            </label>
+            <button class="secondary-button" id="testVoice">Test reference audio</button>
+            <p class="help-text">Built-in words use a natural-sounding Mac voice. The exact recording you hear is also used for the acoustic percentage comparison. The slow button keeps the same speed as Version 7.</p>
+          </section>
+
+          <section class="settings-card">
+            <h2>Sound guide</h2>
+            <div id="soundGuide" class="sound-guide"></div>
+          </section>
+
+          <section class="settings-card danger-zone">
+            <h2>Local data</h2>
+            <button class="secondary-button" id="importButton">Import progress</button>
+            <input id="importFile" type="file" accept="application/json" hidden>
+            <button class="danger-button" id="resetButton">Reset all progress</button>
+            <p class="help-text">Resetting removes scores, custom words and settings from this browser.</p>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>Vocabulary was transcribed from the uploaded Surya Shakti and Ayur Sampoorna sheets. Scores are based on the reference sound, timing and voice clarity. Meanings are brief learning aids.</p>
+    </footer>
+  </div>
+
+  <dialog id="wordDialog">
+    <form method="dialog" id="wordForm">
+      <div class="dialog-heading">
+        <div><p class="eyebrow">Personal vocabulary</p><h2>Add a Sanskrit word</h2></div>
+        <button class="icon-button" value="cancel" aria-label="Close">×</button>
+      </div>
+      <label>Common spelling<input name="common" required placeholder="e.g. Pranayama"></label>
+      <label>IAST transliteration<input name="iast" placeholder="e.g. Prāṇāyāma"></label>
+      <label>Devanagari<input name="devanagari" lang="sa" placeholder="e.g. प्राणायाम"></label>
+      <label>Meaning<input name="meaning" placeholder="Brief meaning"></label>
+      <label>Syllables, separated by hyphens<input name="syllables" required placeholder="prā-ṇā-yā-ma"></label>
+      <label>Pronunciation cue<textarea name="tip" rows="3" placeholder="What sound should you remember?"></textarea></label>
+      <div class="dialog-actions">
+        <button class="secondary-button" value="cancel">Cancel</button>
+        <button class="primary-button" value="default">Save word</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="./app-loader.js?v=8.0.1"></script>
+</body>
+</html>

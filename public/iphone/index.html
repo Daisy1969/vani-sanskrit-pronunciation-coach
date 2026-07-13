@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#b94711">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Surya Shakti">
+  <meta name="description" content="A hands-free Surya Shakti voice guide for iPhone that waits for you to repeat each pose and tracks daily cycles.">
+  <title>Surya Shakti Voice Coach</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="../icons/icon.svg">
+  <link rel="icon" href="../icons/icon.svg">
+  <link rel="stylesheet" href="./styles.css?v=1.0.0">
+</head>
+<body>
+  <main class="app" aria-live="polite">
+    <header class="hero">
+      <div class="sun" aria-hidden="true">☀</div>
+      <div>
+        <p class="eyebrow">iPhone voice practice</p>
+        <h1>Surya Shakti</h1>
+        <p class="subtitle">Listen. Say the pose. Move to the next pose.</p>
+      </div>
+      <button id="settingsButton" class="icon-button" type="button" aria-label="Open settings">⚙︎</button>
+    </header>
+
+    <section class="progress-card" aria-label="Daily progress">
+      <div><strong id="todayCycles">0</strong><span>cycles today</span></div>
+      <div><strong id="daysCompleted">0</strong><span>days completed</span></div>
+      <div><strong id="streakDays">0</strong><span>day streak</span></div>
+    </section>
+
+    <section class="pose-card">
+      <div class="pose-topline">
+        <span id="poseNumber" class="pose-number">1 / 18</span>
+        <span id="sessionCycles" class="session-count">Session: 0 cycles</span>
+      </div>
+      <div class="pose-icon" id="poseIcon" aria-hidden="true">🧘</div>
+      <p id="instruction" class="instruction">Press Start when you are ready.</p>
+      <h2 id="poseName">Samasthiti</h2>
+      <p id="posePronunciation" class="pronunciation">suh-muh-STHI-tee</p>
+      <div class="listening-indicator" id="listeningIndicator" hidden>
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <p id="heardText" class="heard-text" aria-live="assertive"></p>
+    </section>
+
+    <section class="controls">
+      <button id="startButton" class="primary-button" type="button">▶ Start practice</button>
+      <button id="listenButton" class="secondary-button" type="button" hidden>🎤 Listen again</button>
+      <button id="confirmButton" class="secondary-button" type="button" hidden>✓ I said it</button>
+      <button id="pauseButton" class="secondary-button" type="button" hidden>⏸ Pause</button>
+    </section>
+
+    <section class="mini-sequence" aria-label="Sequence position">
+      <div id="sequenceDots" class="sequence-dots"></div>
+    </section>
+
+    <details class="history-panel">
+      <summary>Daily history</summary>
+      <div id="historyList" class="history-list"></div>
+    </details>
+  </main>
+
+  <dialog id="settingsDialog" class="settings-dialog">
+    <form method="dialog">
+      <div class="dialog-heading">
+        <h2>Settings</h2>
+        <button class="icon-button" value="cancel" aria-label="Close settings">✕</button>
+      </div>
+      <label>
+        Voice
+        <select id="voicePreference">
+          <option value="system">Best natural voice</option>
+          <option value="female">Female voice</option>
+          <option value="male">Male voice</option>
+        </select>
+      </label>
+      <label>
+        Speaking speed
+        <input id="speechRate" type="range" min="0.65" max="1.1" step="0.05" value="0.82">
+        <span id="speechRateValue">0.82×</span>
+      </label>
+      <label class="switch-row">
+        <input id="autoContinue" type="checkbox" checked>
+        Continue automatically after hearing the pose
+      </label>
+      <button id="resetTodayButton" class="danger-button" type="button">Reset today's count</button>
+      <p class="settings-note">Progress is stored privately on this iPhone. Nothing is uploaded.</p>
+    </form>
+  </dialog>
+
+  <script src="./app.js?v=1.0.0" defer></script>
+</body>
+</html>

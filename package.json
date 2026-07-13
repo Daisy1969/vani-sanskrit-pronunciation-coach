@@ -1,0 +1,15 @@
+{
+  "name": "vani-sanskrit-pronunciation-coach",
+  "version": "8.0.1",
+  "private": true,
+  "description": "GitHub Pages edition of Vani Sanskrit Pronunciation Coach with macOS-generated male/female reference audio and direct acoustic scoring.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/app-loader.js && node --check public/vocabulary.js",
+    "generate:references": "node scripts/generate-static-reference-audio.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

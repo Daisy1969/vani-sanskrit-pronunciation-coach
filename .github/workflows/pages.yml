@@ -21,6 +21,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Reconstruct Version 8 project
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+
+          parts = sorted(Path('bootstrap').glob('vani-pages-min.tar.xz.b64.part*'))
+          expected = [f'part{i:02d}' for i in range(8)]
+          found = [p.name.rsplit('.', 1)[-1] for p in parts]
+          if found != expected:
+              raise SystemExit(f'Missing archive parts. Expected {expected}, found {found}')
+
+          encoded = ''.join(p.read_text(encoding='utf-8').strip() for p in parts)
+          Path('/tmp/vani-pages-min.tar.xz').write_bytes(base64.b64decode(encoded, validate=True))
+          PY
+          tar -xJf /tmp/vani-pages-min.tar.xz -C .
+
       - name: Set up Pages
         uses: actions/configure-pages@v5
 

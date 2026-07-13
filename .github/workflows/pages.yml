@@ -1,8 +1,6 @@
 name: Build and deploy Vani to GitHub Pages
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -19,37 +17,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Reconstruct Version 8 project
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import base64
-
-          parts = sorted(Path('bootstrap').glob('vani-pages-min.tar.xz.b64.part*'))
-          expected = [f'part{i:02d}' for i in range(8)]
-          found = [p.name.rsplit('.', 1)[-1] for p in parts]
-          if found != expected:
-              raise SystemExit(f'Missing archive parts. Expected {expected}, found {found}')
-
-          output = bytearray()
-          for part in parts:
-              encoded = part.read_text(encoding='utf-8').strip()
-              output.extend(base64.b64decode(encoded, validate=True))
-
-          archive = Path('/tmp/vani-pages-min.tar.xz')
-          archive.write_bytes(output)
-          print(f'Reconstructed {archive} from {len(parts)} parts ({len(output)} bytes)')
-          PY
-          tar -xJf /tmp/vani-pages-min.tar.xz -C .
+        uses: actions/checkout@v6
 
       - name: Set up Pages
         uses: actions/configure-pages@v5
 
       - name: Check JavaScript
         run: npm run check
+
+      - name: Check complete application module
+        run: cat public/app-parts/part*.txt > /tmp/vani-app.mjs && node --check /tmp/vani-app.mjs
 
       - name: Generate male and female Mac reference recordings
         run: node scripts/generate-static-reference-audio.mjs
@@ -58,7 +35,7 @@ jobs:
         run: touch public/.nojekyll
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: public
 

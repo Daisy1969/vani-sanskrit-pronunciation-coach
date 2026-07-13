@@ -1,0 +1,458 @@
+  state.microphoneGainNode.gain.value = Number(state.settings.microphoneGain) || 1;
+
+  state.analyserNode = state.audioContext.createAnalyser();
+  state.analyserNode.fftSize = 2048;
+  state.analyserNode.smoothingTimeConstant = 0.66;
+
+  state.compressorNode = state.audioContext.createDynamicsCompressor();
+  state.compressorNode.threshold.value = -22;
+  state.compressorNode.knee.value = 12;
+  state.compressorNode.ratio.value = 3;
+  state.compressorNode.attack.value = 0.004;
+  state.compressorNode.release.value = 0.18;
+
+  state.voiceGateNode = state.audioContext.createGain();
+  state.voiceGateNode.gain.value = voiceFocusEnabled() ? 0.0001 : 1;
+
+  // Version 7 deliberately records the complete processed microphone signal.
+  // The gate is used only for the live recogniser. After recording, the app scans
+  // the entire waveform, locates the strongest speech-like segment, trims away the
+  // browser chime/background, and recognises that recovered segment a second time.
+  state.recordingDestination = state.audioContext.createMediaStreamDestination();
+  state.recognitionDestination = state.audioContext.createMediaStreamDestination();
+
+  state.audioSourceNode
+    .connect(state.highPassNode)
+    .connect(state.lowPassNode)
+    .connect(state.microphoneGainNode)
+    .connect(state.analyserNode)
+    .connect(state.compressorNode);
+
+  state.compressorNode.connect(state.recordingDestination);
+  state.compressorNode.connect(state.voiceGateNode).connect(state.recognitionDestination);
+
+  state.mediaStream = state.recordingDestination.stream;
+  state.processedAudioTrack = state.recognitionDestination.stream.getAudioTracks()[0] || null;
+  startLevelMonitor();
+}
+
+function cleanupAudioPipeline() {
+  stopLevelMonitor();
+  state.rawMediaStream?.getTracks().forEach((track) => track.stop());
+  state.mediaStream?.getTracks().forEach((track) => track.stop());
+  for (const node of [
+    state.audioSourceNode,
+    state.highPassNode,
+    state.lowPassNode,
+    state.microphoneGainNode,
+    state.compressorNode,
+    state.analyserNode,
+    state.voiceGateNode,
+    state.recordingDestination,
+    state.recognitionDestination
+  ]) {
+    try { node?.disconnect?.(); } catch { /* already disconnected */ }
+  }
+  if (state.audioContext && state.audioContext.state !== 'closed') {
+    state.audioContext.close().catch(() => {});
+  }
+  state.rawMediaStream = null;
+  state.mediaStream = null;
+  state.audioContext = null;
+  state.audioSourceNode = null;
+  state.highPassNode = null;
+  state.lowPassNode = null;
+  state.microphoneGainNode = null;
+  state.compressorNode = null;
+  state.analyserNode = null;
+  state.voiceGateNode = null;
+  state.recordingDestination = null;
+  state.recognitionDestination = null;
+  state.processedAudioTrack = null;
+  state.calibratingNoise = false;
+  state.voiceGateOpen = false;
+  setMeterIdle();
+}
+
+function applyRecognitionPhrases(recognition) {
+  const Phrase = window.SpeechRecognitionPhrase || window.webkitSpeechRecognitionPhrase;
+  if (!Phrase || !('phrases' in recognition)) return;
+  const word = currentWord();
+  const phrases = [
+    word.common,
+    word.iast,
+    word.devanagari,
+    ...(word.accepted || []),
+    ...(word.syllables || []),
+    (word.syllables || []).join(' ')
+  ].filter(Boolean);
+  try {
+    recognition.phrases = [...new Set(phrases)].slice(0, 20)
+      .map((phrase) => new Phrase(String(phrase), 8));
+  } catch {
+    // Contextual biasing is experimental and may not be available.
+  }
+}
+
+function recognitionCandidates(event) {
+  const candidates = [];
+  const primaryParts = [];
+
+  for (let resultIndex = 0; resultIndex < event.results.length; resultIndex += 1) {
+    const result = event.results[resultIndex];
+    const primary = String(result[0]?.transcript || '').trim();
+    if (primary) primaryParts.push(primary);
+    for (let alternativeIndex = 0; alternativeIndex < result.length; alternativeIndex += 1) {
+      const alternative = result[alternativeIndex];
+      const transcript = String(alternative.transcript || '').trim();
+      if (!transcript) continue;
+      candidates.push({
+        transcript,
+        confidence: Number(alternative.confidence || 0),
+        isFinal: Boolean(result.isFinal),
+        resultIndex,
+        alternativeIndex
+      });
+    }
+  }
+
+  const joined = primaryParts.join(' ').replace(/\s+/g, ' ').trim();
+  if (joined) {
+    candidates.push({
+      transcript: joined,
+      confidence: 0,
+      isFinal: [...event.results].every((result) => result.isFinal),
+      resultIndex: 0,
+      alternativeIndex: 0
+    });
+  }
+
+  const unique = new Map();
+  for (const candidate of candidates) {
+    const key = candidate.transcript.toLowerCase();
+    const previous = unique.get(key);
+    if (!previous || candidate.confidence > previous.confidence || candidate.isFinal) {
+      unique.set(key, candidate);
+    }
+  }
+  return [...unique.values()];
+}
+
+function sameOpeningSound(a, b) {
+  const aToken = phoneticTokens(a)[0];
+  const bToken = phoneticTokens(b)[0];
+  return phoneticTokenMatch(aToken, bToken) >= 0.62;
+}
+
+function bestRecognitionAlternative(event) {
+  const candidates = recognitionCandidates(event);
+  let best = { transcript: '', rank: -1, confidence: 0, isFinal: false, score: 0 };
+  for (const candidate of candidates) {
+    const match = scoreTranscript(currentWord(), candidate.transcript);
+    const rank = match.score * 2
+      + match.rawScore * 0.45
+      + match.firstPhoneticScore * 0.35
+      + candidate.confidence * 6
+      + Math.min(candidate.transcript.length, 30) * 0.05;
+    if (rank > best.rank) {
+      best = { ...candidate, rank, score: match.score };
+    }
+  }
+  return { best, candidates };
+}
+
+async function startRecording() {
+  if (state.recording || state.preparingRecording) {
+    stopRecording();
+    return;
+  }
+  if (state.testingMicrophone) stopMicrophoneTest();
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    showToast('Microphone recording is not supported in this browser.');
+    return;
+  }
+
+  state.peakInputLevel = 0;
+  state.voiceDetected = false;
+  state.speechOnsetDetected = false;
+  state.voiceCandidateSince = 0;
+  state.vadArmedAt = 0;
+  state.lastVoiceFrameAt = 0;
+  state.voiceStartedAt = 0;
+  state.silenceSince = 0;
+  state.autoStopRequested = false;
+  state.preparingRecording = true;
+  const session = ++state.recordingSession;
+  setRecordingUi(false, true);
+
+  try {
+    // Load the exact reference before recording. The same local recording is used
+    // for playback and acoustic comparison, so no speech-to-text result is needed.
+    const reference = await loadReferenceAudioBuffer(currentWord()).catch(() => null);
+    if (!reference) {
+      state.preparingRecording = false;
+      setRecordingUi(false);
+      showToast('This word has no acoustic reference recording.');
+      return;
+    }
+
+    await createAudioPipeline();
+    if (session !== state.recordingSession || !state.preparingRecording) return;
+
+    if (voiceFocusEnabled()) {
+      beginNoiseCalibration();
+      els.recordStatus.textContent = 'Measuring the room and birds… stay quiet for one moment.';
+      await sleep(950);
+      if (session !== state.recordingSession || !state.preparingRecording) return;
+      finishNoiseCalibration();
+    } else {
+      setVoiceGate(true, true);
+    }
+
+    state.mediaChunks = [];
+    const mimeType = getSupportedMimeType();
+    const options = mimeType ? { mimeType, audioBitsPerSecond: 128000 } : { audioBitsPerSecond: 128000 };
+    state.mediaRecorder = new MediaRecorder(state.mediaStream, options);
+    state.mediaRecorder.addEventListener('dataavailable', (event) => {
+      if (event.data.size) state.mediaChunks.push(event.data);
+    });
+    state.mediaRecorder.addEventListener('stop', handleRecordingStopped, { once: true });
+
+    state.peakInputLevel = 0;
+    state.mediaRecorder.start(250);
+    state.preparingRecording = false;
+    state.recording = true;
+    state.vadArmedAt = performance.now();
+    setRecordingUi(true);
+    els.recordStatus.textContent = 'Speak now — say the word once. Acoustic Match will search the full recording for the closest voice segment.';
+
+    clearTimeout(state.maxRecordingTimer);
+    state.maxRecordingTimer = setTimeout(() => {
+      if (state.recording) stopRecording();
+    }, 8000);
+  } catch (error) {
+    state.preparingRecording = false;
+    state.recording = false;
+    setRecordingUi(false);
+    cleanupAudioPipeline();
+    showToast(error?.name === 'NotAllowedError'
+      ? 'Microphone permission was denied. Allow Chrome in Mac Privacy & Security and allow this site.'
+      : error?.name === 'NotFoundError'
+        ? 'The selected microphone is unavailable. Choose System default in Settings.'
+        : `Could not start the microphone: ${error?.message || 'unknown error'}`);
+  }
+}
+
+function startBrowserRecognition(forceRawMicrophone = false) {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) {
+    els.recordStatus.textContent = 'Recording for playback. This browser has no speech-to-text support.';
+    state.resolveRecognitionCompletion?.();
+    state.resolveRecognitionCompletion = null;
+    return;
+  }
+
+  try {
+    const recognition = new Recognition();
+    state.recognition = recognition;
+    recognition.lang = state.settings.recognitionLanguage;
+    recognition.interimResults = true;
+    recognition.continuous = true;
+    recognition.maxAlternatives = 10;
+    applyRecognitionPhrases(recognition);
+
+    recognition.onspeechstart = () => {
+      if (!state.recording) return;
+      if (!voiceFocusEnabled()) {
+        state.voiceDetected = true;
+        state.speechOnsetDetected = true;
+        els.recordStatus.textContent = 'First sound detected — keep speaking the word.';
+      } else if (state.speechOnsetDetected) {
+        els.recordStatus.textContent = 'Your voice is reaching the recogniser — keep speaking.';
+      }
+    };
+    recognition.onspeechend = () => {
+      clearTimeout(startBrowserRecognition.finalTimer);
+      startBrowserRecognition.finalTimer = setTimeout(() => {
+        if (state.recording && state.speechOnsetDetected && (state.browserTranscript || state.firstPhoneticTranscript)) {
+          stopRecording();
+        }
+      }, 900);
+    };
+    recognition.onresult = (event) => {
+      // Voice Focus uses the locally calibrated near-field gate as the authority.
+      // Any recogniser result arriving before that gate confirms speech is ignored.
+      if (!state.recording || (voiceFocusEnabled() && !state.speechOnsetDetected)) return;
+      const { best, candidates } = bestRecognitionAlternative(event);
+      if (!best.transcript) return;
+
+      state.voiceDetected = true;
+      for (const candidate of candidates) {
+        if (!state.recognitionHistory.includes(candidate.transcript)) {
+          state.recognitionHistory.push(candidate.transcript);
+        }
+      }
+      state.recognitionHistory = state.recognitionHistory.slice(-30);
+
+      const earliestResultIndex = Math.min(...candidates.map((candidate) => candidate.resultIndex));
+      const firstCandidate = candidates
+        .filter((candidate) => candidate.resultIndex === earliestResultIndex)
+        .map((candidate) => ({
+          ...candidate,
+          openingResult: scoreTranscript(currentWord(), candidate.transcript)
+        }))
+        .sort((a, b) =>
+          b.openingResult.firstPhoneticScore - a.openingResult.firstPhoneticScore
+          || b.openingResult.score - a.openingResult.score
+          || b.confidence - a.confidence
+        )[0];
+      if (firstCandidate?.transcript) {
+        const firstResult = firstCandidate.openingResult;
+        const firstRank = firstResult.score * 2 + firstResult.firstPhoneticScore + firstCandidate.transcript.length * 0.05;
+        const canExtend = !state.firstPhoneticTranscript
+          || sameOpeningSound(state.firstPhoneticTranscript, firstCandidate.transcript);
+        if (canExtend && firstRank >= state.firstPhoneticRank) {
+          state.firstPhoneticTranscript = firstCandidate.transcript;
+          state.firstPhoneticRank = firstRank;
+        }
+      }
+
+      if (!state.browserTranscript || best.rank >= state.browserTranscriptRank) {
+        state.browserTranscript = best.transcript;
+        state.browserTranscriptRank = best.rank;
+      }
+
+      const evaluationText = state.browserTranscript || state.firstPhoneticTranscript;
+      const live = scoreTranscript(currentWord(), evaluationText);
+      els.recordStatus.textContent = `Voice only: ${state.firstPhoneticTranscript || evaluationText} • live match ${live.score}%`;
+      renderLivePhoneticFeedback(evaluationText);
+
+      if (best.isFinal) {
+        clearTimeout(startBrowserRecognition.finalTimer);
+        startBrowserRecognition.finalTimer = setTimeout(() => {
+          if (state.recording) stopRecording();
+        }, 950);
+      }
+    };
+    recognition.onerror = (event) => {
+      if (event.error === 'audio-capture' && state.processedRecognition && state.recording) {
+        // Older Chromium builds may reject the processed MediaStreamTrack. Keep
+        // the local voice gate for acceptance and fall back to the selected mic.
+        state.processedRecognition = false;
+        if (state.recognition === recognition) state.recognition = null;
+        try { recognition.abort(); } catch { /* already stopped */ }
+        setTimeout(() => {
+          if (state.recording && !state.recognition) startBrowserRecognition(true);
+        }, 180);
+        els.recordStatus.textContent = 'Voice gate is active; speech recognition is using the selected microphone fallback.';
+      } else if (event.error === 'no-speech') {
+        els.recordStatus.textContent = voiceFocusEnabled()
+          ? 'Birds and background are being ignored — speak close to the earphone microphone.'
+          : 'No voice detected yet — move the microphone closer and speak again.';
+      } else if (event.error === 'audio-capture') {
+        els.recordStatus.textContent = 'The speech recogniser cannot access the microphone. Check the selected input.';
+      } else if (!['aborted'].includes(event.error)) {
+        els.recordStatus.textContent = `Recognition issue: ${event.error}. The voice-only recording is still being saved.`;
+      }
+    };
+    recognition.onend = () => {
+      if (state.recognition !== recognition) return;
+      state.recognition = null;
+      const hasTranscript = Boolean(state.browserTranscript || state.firstPhoneticTranscript || state.recognitionHistory.length);
+      const shouldRestart = state.recording
+        && !hasTranscript
+        && !state.speechOnsetDetected
+        && state.recognitionRestartCount < 3;
+      if (shouldRestart) {
+        state.recognitionRestartCount += 1;
+        setTimeout(() => {
+          if (state.recording && !state.recognition) startBrowserRecognition(forceRawMicrophone);
+        }, 250);
+        return;
+      }
+      state.resolveRecognitionCompletion?.();
+      state.resolveRecognitionCompletion = null;
+    };
+
+    if (voiceFocusEnabled() && !state.speechOnsetDetected) {
+      state.vadArmedAt = Math.max(state.vadArmedAt, performance.now() + 450);
+      setVoiceGate(false);
+    }
+
+    const canUseProcessedTrack = !forceRawMicrophone
+      && voiceFocusEnabled()
+      && state.processedAudioTrack
+      && state.processedAudioTrack.kind === 'audio'
+      && state.processedAudioTrack.readyState === 'live';
+
+    if (canUseProcessedTrack) {
+      try {
+        recognition.start(state.processedAudioTrack);
+        state.processedRecognition = true;
+      } catch {
+        state.processedRecognition = false;
+        recognition.start();
+      }
+    } else {
+      state.processedRecognition = false;
+      recognition.start();
+    }
+  } catch (error) {
+    els.recordStatus.textContent = `Could not start browser recognition: ${error.message}`;
+    state.resolveRecognitionCompletion?.();
+    state.resolveRecognitionCompletion = null;
+  }
+}
+
+function stopRecording() {
+  if (!state.recording && !state.preparingRecording) return;
+  state.recordingSession += 1;
+  clearTimeout(state.maxRecordingTimer);
+  clearTimeout(startBrowserRecognition.finalTimer);
+
+  if (state.recognition) {
+    try { state.recognition.stop(); } catch { /* already stopped */ }
+  }
+
+  if (state.preparingRecording && !state.recording) {
+    state.preparingRecording = false;
+    setRecordingUi(false);
+    cleanupAudioPipeline();
+    els.recordStatus.textContent = 'Recording cancelled before it began.';
+    return;
+  }
+
+  state.recording = false;
+  state.preparingRecording = false;
+  setVoiceGate(false);
+  if (state.mediaRecorder?.state !== 'inactive') state.mediaRecorder.stop();
+  setRecordingUi(false);
+  els.recordStatus.textContent = 'Scanning the saved audio and comparing it with the reference you heard…';
+}
+
+function setRecordingUi(recording, preparing = false) {
+  els.recordButton.classList.toggle('recording', recording || preparing);
+  els.recordButton.setAttribute('aria-pressed', String(recording || preparing));
+  els.recordLabel.textContent = preparing ? 'Cancel' : recording ? 'Stop' : 'Speak now';
+  els.levelBars.classList.toggle('active', recording);
+}
+
+async function ensurePlaybackAudioGraph() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return;
+  if (!state.playbackAudioContext) {
+    state.playbackAudioContext = new AudioContextClass();
+    state.playbackSourceNode = state.playbackAudioContext.createMediaElementSource(els.playback);
+    state.playbackGainNode = state.playbackAudioContext.createGain();
+    state.playbackSourceNode.connect(state.playbackGainNode).connect(state.playbackAudioContext.destination);
+  }
+  state.playbackGainNode.gain.value = Number(state.settings.playbackGain) || 1;
+  if (state.playbackAudioContext.state === 'suspended') {
+    await state.playbackAudioContext.resume();
+  }
+}
+
+
+function clamp(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
+}

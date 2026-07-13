@@ -1,0 +1,408 @@
+    els.recordStatus.textContent = 'Enhanced recognition failed. Your recording is ready for playback.';
+    els.feedbackCard.className = 'feedback-card low';
+    els.feedbackTitle.textContent = 'Could not analyse this recording';
+    els.heardText.textContent = error.message;
+    els.focusFeedback.textContent = 'Switch to Browser recognition in Settings or check the server API key.';
+  }
+}
+
+async function startMicrophoneTest() {
+  if (state.recording) {
+    showToast('Finish the current recording before testing the microphone.');
+    return;
+  }
+  if (state.testingMicrophone) {
+    stopMicrophoneTest();
+    return;
+  }
+  state.testingMicrophone = true;
+  state.peakInputLevel = 0;
+  state.voiceDetected = false;
+  state.speechOnsetDetected = false;
+  state.autoStopRequested = false;
+  els.testMicrophone.textContent = 'Stop microphone test';
+  els.micTestStatus.textContent = 'Starting microphone…';
+
+  try {
+    await createAudioPipeline();
+    if (voiceFocusEnabled()) {
+      beginNoiseCalibration();
+      els.micTestStatus.textContent = 'Stay quiet for 1 second while Voice Focus measures the birds and room noise.';
+      await sleep(1250);
+      if (!state.testingMicrophone) return;
+      finishNoiseCalibration();
+      state.vadArmedAt = performance.now();
+      els.micTestStatus.textContent = 'Now speak close to the earphone microphone. Background sounds should remain ignored.';
+    } else {
+      setVoiceGate(true, true);
+      els.micTestStatus.textContent = 'Speak normally for a few seconds. The meter should reach Good or Strong.';
+    }
+    clearTimeout(state.microphoneTestTimer);
+    state.microphoneTestTimer = setTimeout(stopMicrophoneTest, 11000);
+  } catch (error) {
+    state.testingMicrophone = false;
+    els.testMicrophone.textContent = 'Test microphone';
+    cleanupAudioPipeline();
+    els.micTestStatus.textContent = `Microphone test failed: ${error?.message || 'unknown error'}`;
+  }
+}
+
+function stopMicrophoneTest() {
+  if (!state.testingMicrophone) return;
+  state.testingMicrophone = false;
+  clearTimeout(state.microphoneTestTimer);
+  els.testMicrophone.textContent = 'Test microphone';
+  const quality = levelText(state.peakInputLevel);
+  els.micTestStatus.textContent = state.voiceDetected
+    ? `Test complete. Your near-field voice passed Voice Focus. Peak level: ${quality}.`
+    : voiceFocusEnabled()
+      ? 'No close voice crossed the gate. Move the earphone microphone nearer or lower Background rejection.'
+      : 'No useful voice level was detected. Try another microphone or raise the boost.';
+  cleanupAudioPipeline();
+}
+
+function renderStats() {
+  const progressEntries = Object.values(state.progress);
+  const attempted = progressEntries.filter((item) => item.attempts > 0).length;
+  const mastered = progressEntries.filter((item) => item.best >= 85).length;
+  const average = attempted
+    ? Math.round(progressEntries.reduce((sum, item) => sum + (item.best || 0), 0) / attempted)
+    : 0;
+  const today = dateKey(new Date());
+  const todayAttempts = state.activity.filter((item) => dateKey(new Date(item.at)) === today).length;
+  const streak = calculateStreak();
+
+  els.dailyCount.textContent = Math.min(todayAttempts, 5);
+  els.quickStats.innerHTML = [
+    [attempted, 'words practised'], [mastered, 'words mastered'], [`${average}%`, 'average best score'], [`${streak} day${streak === 1 ? '' : 's'}`, 'practice streak']
+  ].map(([value, label]) => `<div class="stat-card"><strong>${value}</strong><span>${label}</span></div>`).join('');
+
+  els.progressStats.innerHTML = [
+    [state.activity.length, 'total attempts'], [attempted, 'different words'], [mastered, 'mastered at 85%+'], [`${average}%`, 'average best score']
+  ].map(([value, label]) => `<div class="stat-card"><strong>${value}</strong><span>${label}</span></div>`).join('');
+}
+
+function dateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function calculateStreak() {
+  const days = new Set(state.activity.map((item) => dateKey(new Date(item.at))));
+  let streak = 0;
+  const cursor = new Date();
+  if (!days.has(dateKey(cursor))) cursor.setDate(cursor.getDate() - 1);
+  while (days.has(dateKey(cursor))) {
+    streak += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+}
+
+function renderSequence() {
+  const sequence = SURYA_SHAKTI_SEQUENCE.map(getWord).filter(Boolean);
+  state.sequenceIndex = Math.min(Math.max(0, state.sequenceIndex), sequence.length - 1);
+  const current = sequence[state.sequenceIndex];
+  els.sequenceGrid.innerHTML = sequence.map((word, index) => {
+    const status = index < state.sequenceIndex ? 'done' : index === state.sequenceIndex ? 'current' : '';
+    return `<button class="sequence-step ${status}" data-sequence-index="${index}" title="${escapeHtml(word.common)}">${index + 1}</button>`;
+  }).join('');
+  els.sequenceGrid.querySelectorAll('[data-sequence-index]').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.sequenceIndex = Number(button.dataset.sequenceIndex);
+      saveState();
+      renderSequence();
+    });
+  });
+  els.sequenceProgressBar.style.width = `${((state.sequenceIndex + 1) / sequence.length) * 100}%`;
+  els.sequenceCounter.textContent = `Step ${state.sequenceIndex + 1} of ${sequence.length}`;
+  els.sequenceDevanagari.textContent = current.devanagari;
+  els.sequenceIast.textContent = current.iast;
+  els.sequenceSyllables.textContent = current.syllables.join(' · ');
+  els.sequenceBack.disabled = state.sequenceIndex === 0;
+  els.sequenceNext.textContent = state.sequenceIndex === sequence.length - 1 ? 'Finish ✓' : 'Next →';
+}
+
+function sequenceNext() {
+  if (state.sequenceIndex < SURYA_SHAKTI_SEQUENCE.length - 1) state.sequenceIndex += 1;
+  else {
+    state.sequenceIndex = 0;
+    showToast('Sequence completed. Starting again from step 1.');
+  }
+  saveState();
+  renderSequence();
+}
+
+function sequenceBack() {
+  if (state.sequenceIndex > 0) state.sequenceIndex -= 1;
+  saveState();
+  renderSequence();
+}
+
+function renderLibrary() {
+  const query = els.librarySearch.value.trim().toLowerCase();
+  const lesson = els.libraryLesson.value || 'all';
+  const words = allWords().filter((word) => {
+    const haystack = [word.common, word.iast, word.devanagari, word.meaning, word.lesson].join(' ').toLowerCase();
+    return (lesson === 'all' || word.lesson === lesson) && (!query || haystack.includes(query));
+  });
+
+  els.wordLibrary.innerHTML = words.length ? words.map((word) => {
+    const progress = state.progress[word.id];
+    const best = progress?.best ? `${progress.best}% best` : 'New';
+    const isCustom = word.lesson === 'My words';
+    return `<article class="library-card">
+      <div class="library-meta"><span>${escapeHtml(word.lesson)}</span><span class="score-pill">${best}</span></div>
+      <div class="library-dev" lang="sa">${escapeHtml(word.devanagari || '—')}</div>
+      <h3>${escapeHtml(word.iast || word.common)}</h3>
+      <p><strong>${escapeHtml(word.common)}</strong> — ${escapeHtml(word.meaning || '')}</p>
+      <p>${word.syllables.map(escapeHtml).join(' · ')}</p>
+      <div class="library-actions">
+        <button class="secondary-button" data-listen-word="${word.id}">🔊 Hear</button>
+        <button class="primary-button" data-practice-word="${word.id}">Practise</button>
+        ${isCustom ? `<button class="danger-button" data-delete-word="${word.id}" aria-label="Delete ${escapeHtml(word.common)}">×</button>` : ''}
+      </div>
+    </article>`;
+  }).join('') : '<p>No words match this search.</p>';
+
+  els.wordLibrary.querySelectorAll('[data-listen-word]').forEach((button) => {
+    button.addEventListener('click', () => speakWord(getWord(button.dataset.listenWord)));
+  });
+  els.wordLibrary.querySelectorAll('[data-practice-word]').forEach((button) => {
+    button.addEventListener('click', () => practiseSpecificWord(button.dataset.practiceWord));
+  });
+  els.wordLibrary.querySelectorAll('[data-delete-word]').forEach((button) => {
+    button.addEventListener('click', () => deleteCustomWord(button.dataset.deleteWord));
+  });
+}
+
+function practiseSpecificWord(id) {
+  const word = getWord(id);
+  if (!word) return;
+  state.settings.selectedLesson = word.lesson;
+  els.lessonSelect.value = word.lesson;
+  resetPracticeWords(false);
+  state.currentIndex = state.practiceWords.findIndex((item) => item.id === id);
+  renderPracticeWord();
+  switchView('practice');
+}
+
+function deleteCustomWord(id) {
+  const word = state.customWords.find((item) => item.id === id);
+  if (!word || !confirm(`Delete “${word.common}” from your custom words?`)) return;
+  state.customWords = state.customWords.filter((item) => item.id !== id);
+  delete state.progress[id];
+  saveState();
+  populateLessonSelectors();
+  renderLibrary();
+  renderStats();
+}
+
+function renderProgress() {
+  renderStats();
+  const rows = allWords().map((word) => {
+    const item = state.progress[word.id];
+    const status = !item?.attempts ? ['New', 'new'] : item.best >= 85 ? ['Mastered', 'mastered'] : ['Learning', 'learning'];
+    const last = item?.last ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(item.last)) : '—';
+    return `<tr>
+      <td><strong>${escapeHtml(word.iast || word.common)}</strong><br><small>${escapeHtml(word.devanagari || '')}</small></td>
+      <td>${item?.best ? `${item.best}%` : '—'}</td>
+      <td>${item?.attempts || 0}</td>
+      <td>${last}</td>
+      <td><span class="status-chip ${status[1]}">${status[0]}</span></td>
+    </tr>`;
+  }).join('');
+  els.progressTable.innerHTML = rows;
+}
+
+function renderSettings() {
+  if (els.rateSlider) {
+    els.rateSlider.value = String(state.settings.rate);
+    els.rateOutput.value = `${Number(state.settings.rate).toFixed(2)}×`;
+  }
+  if (els.referenceGainSlider) {
+    els.referenceGainSlider.value = String(state.settings.referenceGain || 1.55);
+    els.referenceGainOutput.value = `${Number(state.settings.referenceGain || 1.55).toFixed(2)}×`;
+  }
+  if (els.referenceVoiceGender) {
+    els.referenceVoiceGender.value = state.settings.referenceVoiceGender === 'male' ? 'male' : 'female';
+  }
+  if (els.referenceVoiceStatus) {
+    const voices = state.server?.naturalVoices;
+    if (voices) {
+      const selected = state.settings.referenceVoiceGender === 'male' ? voices.male : voices.female;
+      els.referenceVoiceStatus.textContent = selected?.available
+        ? `Using the published ${state.settings.referenceVoiceGender === 'male' ? 'male' : 'female'} Mac reference voice. The same recording is used for playback and scoring.`
+        : 'This published voice recording is unavailable. Try the other option.';
+    } else {
+      els.referenceVoiceStatus.textContent = 'Choose the published male or female Mac reference voice. The same recording is used for playback and scoring.';
+    }
+  }
+  els.micGainSlider.value = String(state.settings.microphoneGain);
+  els.micGainOutput.value = `${Number(state.settings.microphoneGain).toFixed(2)}×`;
+  els.playbackGainSlider.value = String(state.settings.playbackGain);
+  els.playbackGainOutput.value = `${Number(state.settings.playbackGain).toFixed(2)}×`;
+  els.earphoneMode.checked = voiceFocusEnabled();
+  els.voiceGateSlider.value = String(state.settings.voiceGateDb);
+  els.voiceGateOutput.value = `${Number(state.settings.voiceGateDb)} dB`;
+  renderMicrophoneOptions();
+  renderAppliedAudioStatus();
+  els.soundGuide.innerHTML = SOUND_GUIDE.map((item) => `<div class="sound-item"><strong>${escapeHtml(item.symbol)}</strong><p>${escapeHtml(item.explanation)}</p></div>`).join('');
+  if (els.voiceSelect) loadVoices();
+}
+
+function updateEngineSummary() {
+  els.engineSummary.textContent = 'Acoustic Match compares your recorded sound pattern directly with the same reference audio you heard. It does not require Chrome to turn your voice into text.';
+}
+
+async function checkServerStatus() {
+  state.server = {
+    sarvamEnabled: false,
+    naturalVoices: {
+      female: { available: true, name: 'Female Mac reference', lang: 'en-IN' },
+      male: { available: true, name: 'Male Mac reference', lang: 'en-IN' }
+    }
+  };
+  state.settings.engine = 'acoustic';
+  saveState();
+  updateEngineSummary();
+  renderSettings();
+}
+
+function exportProgress() {
+  const data = {
+    app: 'Vāṇī Sanskrit Pronunciation Coach',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    settings: state.settings,
+    progress: state.progress,
+    activity: state.activity,
+    customWords: state.customWords
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `vani-progress-${dateKey(new Date())}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+async function importProgress(file) {
+  try {
+    const data = JSON.parse(await file.text());
+    if (!data || typeof data !== 'object') throw new Error('Invalid file.');
+    state.settings = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
+    state.progress = data.progress || {};
+    state.activity = Array.isArray(data.activity) ? data.activity : [];
+    state.customWords = Array.isArray(data.customWords) ? data.customWords : [];
+    saveState();
+    populateLessonSelectors();
+    renderStats();
+    renderProgress();
+    renderSettings();
+    showToast('Progress imported successfully.');
+  } catch (error) {
+    showToast(`Could not import: ${error.message}`);
+  } finally {
+    els.importFile.value = '';
+  }
+}
+
+function resetAllData() {
+  if (!confirm('Reset all scores, custom words and settings on this device?')) return;
+  localStorage.removeItem(STORAGE_KEY);
+  location.reload();
+}
+
+function addCustomWord(form) {
+  const data = new FormData(form);
+  const common = String(data.get('common') || '').trim();
+  const iast = String(data.get('iast') || '').trim() || common;
+  const devanagari = String(data.get('devanagari') || '').trim();
+  const meaning = String(data.get('meaning') || '').trim();
+  const syllables = String(data.get('syllables') || '').split(/[-·]/).map((part) => part.trim()).filter(Boolean);
+  const tip = String(data.get('tip') || '').trim() || 'Listen and repeat each syllable clearly.';
+  if (!common || !syllables.length) return;
+  const id = `custom-${Date.now()}-${strictKey(common).slice(0, 20)}`;
+  state.customWords.push({
+    id, lesson: 'My words', common, iast, devanagari, meaning, syllables,
+    accepted: [common, iast, devanagari].filter(Boolean), focus: [], tip
+  });
+  saveState();
+  form.reset();
+  els.wordDialog.close();
+  populateLessonSelectors();
+  els.libraryLesson.value = 'My words';
+  renderLibrary();
+  showToast(`Added “${common}”.`);
+}
+
+function initEvents() {
+  els.lessonSelect.addEventListener('change', () => {
+    state.currentIndex = 0;
+    resetPracticeWords(false);
+  });
+  els.shuffleButton.addEventListener('click', () => resetPracticeWords(true));
+  els.previousButton.addEventListener('click', previousWord);
+  els.nextButton.addEventListener('click', nextWord);
+  els.listenButton.addEventListener('click', () => speakWord(currentWord(), false));
+  els.slowButton.addEventListener('click', () => speakWord(currentWord(), true));
+  els.recordButton.addEventListener('click', startRecording);
+  els.playback.addEventListener('play', () => ensurePlaybackAudioGraph().catch(() => {}));
+
+  els.restartSequence.addEventListener('click', () => { state.sequenceIndex = 0; saveState(); renderSequence(); });
+  els.sequenceListen.addEventListener('click', () => speakWord(getWord(SURYA_SHAKTI_SEQUENCE[state.sequenceIndex])));
+  els.sequenceBack.addEventListener('click', sequenceBack);
+  els.sequenceNext.addEventListener('click', sequenceNext);
+
+  els.librarySearch.addEventListener('input', renderLibrary);
+  els.libraryLesson.addEventListener('change', renderLibrary);
+  els.addWordButton.addEventListener('click', () => els.wordDialog.showModal());
+  els.wordForm.addEventListener('submit', (event) => {
+    const submitter = event.submitter;
+    if (submitter?.value === 'cancel') return;
+    event.preventDefault();
+    addCustomWord(event.currentTarget);
+  });
+
+  els.exportButton.addEventListener('click', exportProgress);
+  els.importButton.addEventListener('click', () => els.importFile.click());
+  els.importFile.addEventListener('change', () => els.importFile.files[0] && importProgress(els.importFile.files[0]));
+  els.resetButton.addEventListener('click', resetAllData);
+
+  if (els.voiceSelect) els.voiceSelect.addEventListener('change', () => {
+    state.settings.voiceURI = els.voiceSelect.value;
+    saveState();
+  });
+  if (els.referenceVoiceGender) els.referenceVoiceGender.addEventListener('change', () => {
+    state.settings.referenceVoiceGender = els.referenceVoiceGender.value === 'male' ? 'male' : 'female';
+    state.referenceAudioCache.clear();
+    state.referenceFeatureCache.clear();
+    try { state.referencePlaybackSource?.stop(); } catch { /* already stopped */ }
+    saveState();
+    renderSettings();
+  });
+  els.rateSlider.addEventListener('input', () => {
+    state.settings.rate = Number(els.rateSlider.value);
+    els.rateOutput.value = `${state.settings.rate.toFixed(2)}×`;
+    saveState();
+  });
+  els.testVoice.addEventListener('click', () => speakWord(currentWord()));
+  if (els.referenceGainSlider) {
+    els.referenceGainSlider.addEventListener('input', () => {
+      state.settings.referenceGain = Number(els.referenceGainSlider.value);
+      els.referenceGainOutput.value = `${state.settings.referenceGain.toFixed(2)}×`;
+      saveState();
+    });
+  }
+
+  els.microphoneSelect.addEventListener('change', () => {
+    state.settings.microphoneDeviceId = els.microphoneSelect.value;
+    saveState();
+    renderMicrophoneOptions();
+  });
+  els.refreshMicrophonesButton.addEventListener('click', () => refreshMicrophoneDevices(true));
+  els.micGainSlider.addEventListener('input', () => {

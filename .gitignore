@@ -1,0 +1,5 @@
+.generated-reference-audio/
+public/audio/natural/
+.env
+.DS_Store
+node_modules/

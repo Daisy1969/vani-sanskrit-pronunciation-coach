@@ -1,0 +1,18 @@
+{
+  "name": "Vāṇī Sanskrit Pronunciation Coach",
+  "short_name": "Vāṇī Coach",
+  "description": "Listen, repeat, record and improve Sanskrit pronunciation.",
+  "start_url": "./#practice",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#fffaf2",
+  "theme_color": "#7c2d12",
+  "icons": [
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

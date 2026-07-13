@@ -1,0 +1,437 @@
+function downmixAndResample(audioBuffer, targetRate = 16000) {
+  const sourceRate = audioBuffer.sampleRate;
+  const sourceLength = audioBuffer.length;
+  const channels = Array.from({ length: audioBuffer.numberOfChannels }, (_, index) => audioBuffer.getChannelData(index));
+  const targetLength = Math.max(1, Math.round(sourceLength * targetRate / sourceRate));
+  const output = new Float32Array(targetLength);
+
+  for (let index = 0; index < targetLength; index += 1) {
+    const sourcePosition = index * sourceRate / targetRate;
+    const left = Math.floor(sourcePosition);
+    const right = Math.min(sourceLength - 1, left + 1);
+    const fraction = sourcePosition - left;
+    let sample = 0;
+    for (const channel of channels) {
+      sample += channel[left] * (1 - fraction) + channel[right] * fraction;
+    }
+    output[index] = sample / Math.max(1, channels.length);
+  }
+  return { samples: output, sampleRate: targetRate };
+}
+
+function goertzelPower(samples, start, length, sampleRate, frequency) {
+  const omega = 2 * Math.PI * frequency / sampleRate;
+  const coefficient = 2 * Math.cos(omega);
+  let previous = 0;
+  let previous2 = 0;
+  for (let index = 0; index < length; index += 1) {
+    const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * index / Math.max(1, length - 1));
+    const value = (samples[start + index] || 0) * window + coefficient * previous - previous2;
+    previous2 = previous;
+    previous = value;
+  }
+  return Math.max(0, previous2 * previous2 + previous * previous - coefficient * previous * previous2);
+}
+
+function analyseVoiceFrames(audioBuffer) {
+  const { samples, sampleRate } = downmixAndResample(audioBuffer, 16000);
+  const frameSize = Math.round(sampleRate * 0.025);
+  const hopSize = Math.round(sampleRate * 0.010);
+  const frequencies = [180, 260, 380, 550, 800, 1150, 1600, 2200, 3000, 4200, 5400];
+  const frames = [];
+
+  for (let start = 0; start + frameSize <= samples.length; start += hopSize) {
+    let sumSquares = 0;
+    let crossings = 0;
+    let previous = samples[start] || 0;
+    for (let offset = 0; offset < frameSize; offset += 1) {
+      const sample = samples[start + offset] || 0;
+      sumSquares += sample * sample;
+      if ((sample >= 0) !== (previous >= 0)) crossings += 1;
+      previous = sample;
+    }
+    const rms = Math.sqrt(sumSquares / frameSize);
+    const zcr = crossings / frameSize;
+    const bands = frequencies.map((frequency) => goertzelPower(samples, start, frameSize, sampleRate, frequency));
+    const total = bands.reduce((sum, value) => sum + value, 0) + 1e-12;
+    const voiceEnergy = bands.slice(0, 9).reduce((sum, value) => sum + value, 0);
+    const lowVoiceEnergy = bands.slice(0, 7).reduce((sum, value) => sum + value, 0);
+    const maximum = Math.max(...bands, 1e-12);
+    const spread = bands.filter((value) => value >= maximum * 0.10).length;
+    frames.push({
+      time: start / sampleRate,
+      rms,
+      zcr,
+      voiceRatio: voiceEnergy / total,
+      lowVoiceRatio: lowVoiceEnergy / total,
+      concentration: maximum / total,
+      spread
+    });
+  }
+  return { frames, samples, sampleRate, hopSeconds: hopSize / sampleRate };
+}
+
+function mergeSpeechSegments(activeFrames, hopSeconds) {
+  const segments = [];
+  let start = -1;
+  for (let index = 0; index <= activeFrames.length; index += 1) {
+    if (activeFrames[index] && start < 0) start = index;
+    if ((!activeFrames[index] || index === activeFrames.length) && start >= 0) {
+      segments.push({ startFrame: start, endFrame: index - 1 });
+      start = -1;
+    }
+  }
+
+  const merged = [];
+  const mergeGapFrames = Math.round(0.24 / hopSeconds);
+  for (const segment of segments) {
+    const previous = merged.at(-1);
+    if (previous && segment.startFrame - previous.endFrame <= mergeGapFrames) {
+      previous.endFrame = segment.endFrame;
+    } else {
+      merged.push({ ...segment });
+    }
+  }
+  return merged;
+}
+
+function findVoiceSegment(audioBuffer) {
+  const analysis = analyseVoiceFrames(audioBuffer);
+  const { frames, hopSeconds } = analysis;
+  if (!frames.length) return { found: false, start: 0, end: audioBuffer.duration, confidence: 0, analysis };
+
+  const rmsValues = frames.map((frame) => frame.rms).filter(Number.isFinite);
+  // A whole-recording low percentile is more robust than assuming the first
+  // moment is quiet; it survives Chrome's start chime and intermittent birds.
+  const noiseFloor = Math.max(0.0008, percentile(rmsValues, 0.22));
+  const configuredSeparation = Math.pow(10, Number(state.settings.voiceGateDb || 11) / 20);
+  const energyThreshold = Math.max(noiseFloor * Math.max(1.9, configuredSeparation * 0.56), 0.0045);
+
+  const rawActive = frames.map((frame) => {
+    const snrDb = 20 * Math.log10((frame.rms + 1e-7) / (noiseFloor + 1e-7));
+    const broadEnough = frame.spread >= 3 || frame.concentration <= 0.68;
+    const speechBand = frame.voiceRatio >= 0.55 && frame.lowVoiceRatio >= 0.35;
+    const plausibleCrossing = frame.zcr >= 0.012 && frame.zcr <= 0.34;
+    return frame.rms >= energyThreshold
+      && snrDb >= 4.0
+      && speechBand
+      && broadEnough
+      && plausibleCrossing;
+  });
+
+  // Require repeated speech-like frames, then add a small hangover so unvoiced
+  // consonants at either side of a vowel are not cut away.
+  const supported = rawActive.map((_, index) => {
+    let count = 0;
+    for (let offset = -7; offset <= 7; offset += 1) {
+      if (rawActive[index + offset]) count += 1;
+    }
+    return count >= 3;
+  });
+  const expanded = supported.map((_, index) => {
+    for (let offset = -10; offset <= 12; offset += 1) {
+      if (supported[index + offset]) return true;
+    }
+    return false;
+  });
+
+  const candidates = mergeSpeechSegments(expanded, hopSeconds)
+    .map((segment) => {
+      const start = segment.startFrame * hopSeconds;
+      const end = Math.min(audioBuffer.duration, (segment.endFrame + 1) * hopSeconds + 0.025);
+      const duration = end - start;
+      const segmentFrames = frames.slice(segment.startFrame, segment.endFrame + 1);
+      const averageSnr = segmentFrames.reduce((sum, frame) => (
+        sum + 20 * Math.log10((frame.rms + 1e-7) / (noiseFloor + 1e-7))
+      ), 0) / Math.max(1, segmentFrames.length);
+      const averageVoiceRatio = segmentFrames.reduce((sum, frame) => sum + frame.voiceRatio, 0) / Math.max(1, segmentFrames.length);
+      const averageSpread = segmentFrames.reduce((sum, frame) => sum + frame.spread, 0) / Math.max(1, segmentFrames.length);
+      const expectedDuration = clamp(0.38 + (currentWord().syllables?.length || 2) * 0.29, 0.75, 4.8);
+      const durationFit = Math.exp(-Math.abs(Math.log(Math.max(0.16, duration) / expectedDuration)));
+      const earlyChimePenalty = end < 0.48 ? 18 : start < 0.32 ? 7 : 0;
+      const score = durationFit * 35
+        + clamp(averageSnr, 0, 25) * 1.25
+        + averageVoiceRatio * 24
+        + clamp(averageSpread, 0, 7) * 2
+        + Math.min(duration, 3.8) * 4
+        - earlyChimePenalty;
+      return { start, end, duration, score, averageSnr, averageVoiceRatio, averageSpread };
+    })
+    .filter((segment) => segment.duration >= 0.20 && segment.duration <= 7.0)
+    .sort((a, b) => b.score - a.score);
+
+  let best = candidates[0];
+  let fallback = false;
+  if (!best) {
+    // Last-resort recovery: take the highest-energy window after the initial
+    // browser sound. This still lets recorded-audio recognition inspect the part
+    // most likely to contain the user's word instead of giving up immediately.
+    const windowFrames = Math.max(1, Math.round(Math.min(3.2, audioBuffer.duration) / hopSeconds));
+    let bestEnergy = -1;
+    let bestIndex = 0;
+    for (let index = Math.round(0.30 / hopSeconds); index + windowFrames <= frames.length; index += 1) {
+      let energy = 0;
+      for (let offset = 0; offset < windowFrames; offset += 1) energy += frames[index + offset].rms;
+      if (energy > bestEnergy) {
+        bestEnergy = energy;
+        bestIndex = index;
+      }
+    }
+    best = {
+      start: bestIndex * hopSeconds,
+      end: Math.min(audioBuffer.duration, (bestIndex + windowFrames) * hopSeconds),
+      duration: windowFrames * hopSeconds,
+      score: 18,
+      averageSnr: 0,
+      averageVoiceRatio: 0,
+      averageSpread: 0
+    };
+    fallback = true;
+  }
+
+  const preRoll = 0.24;
+  const postRoll = 0.34;
+  const start = Math.max(0, best.start - preRoll);
+  const end = Math.min(audioBuffer.duration, best.end + postRoll);
+  const confidence = fallback ? 0.25 : clamp((best.score - 25) / 70, 0.35, 0.98);
+  return {
+    found: !fallback || best.score >= 30,
+    fallback,
+    start,
+    end,
+    confidence,
+    noiseFloor,
+    candidates: candidates.slice(0, 12),
+    analysis
+  };
+}
+
+function extractNormalisedMonoBuffer(audioBuffer, startSeconds, endSeconds) {
+  const sampleRate = audioBuffer.sampleRate;
+  const startSample = clamp(Math.floor(startSeconds * sampleRate), 0, audioBuffer.length - 1);
+  const endSample = clamp(Math.ceil(endSeconds * sampleRate), startSample + 1, audioBuffer.length);
+  const length = endSample - startSample;
+  const output = new AudioBuffer({ numberOfChannels: 1, length, sampleRate });
+  const destination = output.getChannelData(0);
+  let peak = 0;
+
+  for (let index = 0; index < length; index += 1) {
+    let sample = 0;
+    for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+      sample += audioBuffer.getChannelData(channel)[startSample + index] || 0;
+    }
+    sample /= Math.max(1, audioBuffer.numberOfChannels);
+    destination[index] = sample;
+    peak = Math.max(peak, Math.abs(sample));
+  }
+
+  const targetPeak = 0.86;
+  const gain = peak > 0.0001 ? Math.min(5, targetPeak / peak) : 1;
+  // Short fades avoid clicks while preserving the first consonant inside the
+  // 240 ms pre-roll.
+  const fadeSamples = Math.min(Math.round(sampleRate * 0.018), Math.floor(length / 3));
+  for (let index = 0; index < length; index += 1) {
+    let envelope = 1;
+    if (index < fadeSamples) envelope = index / Math.max(1, fadeSamples);
+    else if (index >= length - fadeSamples) envelope = (length - 1 - index) / Math.max(1, fadeSamples);
+    destination[index] = clamp(destination[index] * gain * Math.max(0, envelope), -1, 1);
+  }
+  return output;
+}
+
+function audioBufferToWavBlob(audioBuffer) {
+  const samples = audioBuffer.getChannelData(0);
+  const bytesPerSample = 2;
+  const dataLength = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(buffer);
+  const writeString = (offset, value) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataLength, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, audioBuffer.sampleRate, true);
+  view.setUint32(28, audioBuffer.sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataLength, true);
+  let offset = 44;
+  for (const sample of samples) {
+    const clipped = clamp(sample, -1, 1);
+    view.setInt16(offset, clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+
+const acousticDspCache = new Map();
+
+function trimSamplesByEnergy(samples, sampleRate) {
+  const frameSize = Math.max(160, Math.round(sampleRate * 0.020));
+  const hopSize = Math.max(80, Math.round(sampleRate * 0.010));
+  const energies = [];
+  for (let start = 0; start + frameSize <= samples.length; start += hopSize) {
+    let sum = 0;
+    for (let i = 0; i < frameSize; i += 1) {
+      const value = samples[start + i] || 0;
+      sum += value * value;
+    }
+    energies.push(Math.sqrt(sum / frameSize));
+  }
+  if (!energies.length) return samples;
+  const sorted = [...energies].sort((a, b) => a - b);
+  const noise = sorted[Math.floor(sorted.length * 0.20)] || 0;
+  const peak = Math.max(...energies, 0.0001);
+  const threshold = Math.max(0.0025, noise * 2.1, peak * 0.055);
+  const active = energies.map((energy, index) => {
+    let count = 0;
+    for (let offset = -3; offset <= 3; offset += 1) {
+      if ((energies[index + offset] || 0) >= threshold) count += 1;
+    }
+    return count >= 2;
+  });
+  let first = active.findIndex(Boolean);
+  let last = -1;
+  for (let i = active.length - 1; i >= 0; i -= 1) {
+    if (active[i]) { last = i; break; }
+  }
+  if (first < 0 || last < first) return samples;
+  const pre = Math.round(sampleRate * 0.075);
+  const post = Math.round(sampleRate * 0.110);
+  const start = Math.max(0, first * hopSize - pre);
+  const end = Math.min(samples.length, last * hopSize + frameSize + post);
+  return samples.slice(start, end);
+}
+
+function prepareSpeechSamples(audioBuffer, targetRate = 16000) {
+  let { samples, sampleRate } = downmixAndResample(audioBuffer, targetRate);
+  samples = trimSamplesByEnergy(samples, sampleRate);
+  if (!samples.length) return { samples, sampleRate };
+  let mean = 0;
+  for (const value of samples) mean += value;
+  mean /= samples.length;
+  const output = new Float32Array(samples.length);
+  let sumSquares = 0;
+  let previous = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    const centered = samples[i] - mean;
+    const emphasized = centered - 0.94 * previous;
+    previous = centered;
+    output[i] = emphasized;
+    sumSquares += emphasized * emphasized;
+  }
+  const rms = Math.sqrt(sumSquares / Math.max(1, output.length));
+  const gain = rms > 1e-5 ? Math.min(12, 0.10 / rms) : 1;
+  for (let i = 0; i < output.length; i += 1) output[i] = clamp(output[i] * gain, -1, 1);
+  return { samples: output, sampleRate };
+}
+
+function fftPowerSpectrum(frame, fftSize) {
+  const real = new Float64Array(fftSize);
+  const imag = new Float64Array(fftSize);
+  real.set(frame.subarray(0, Math.min(frame.length, fftSize)));
+
+  for (let i = 1, j = 0; i < fftSize; i += 1) {
+    let bit = fftSize >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = real[i]; real[i] = real[j]; real[j] = tr;
+      const ti = imag[i]; imag[i] = imag[j]; imag[j] = ti;
+    }
+  }
+  for (let length = 2; length <= fftSize; length <<= 1) {
+    const angle = -2 * Math.PI / length;
+    const wLenR = Math.cos(angle);
+    const wLenI = Math.sin(angle);
+    for (let i = 0; i < fftSize; i += length) {
+      let wr = 1;
+      let wi = 0;
+      for (let j = 0; j < length / 2; j += 1) {
+        const even = i + j;
+        const odd = even + length / 2;
+        const vr = real[odd] * wr - imag[odd] * wi;
+        const vi = real[odd] * wi + imag[odd] * wr;
+        const ur = real[even];
+        const ui = imag[even];
+        real[even] = ur + vr;
+        imag[even] = ui + vi;
+        real[odd] = ur - vr;
+        imag[odd] = ui - vi;
+        const nextWr = wr * wLenR - wi * wLenI;
+        wi = wr * wLenI + wi * wLenR;
+        wr = nextWr;
+      }
+    }
+  }
+  const output = new Float64Array(fftSize / 2 + 1);
+  for (let i = 0; i < output.length; i += 1) output[i] = (real[i] * real[i] + imag[i] * imag[i]) / fftSize;
+  return output;
+}
+
+function hzToMel(hz) { return 2595 * Math.log10(1 + hz / 700); }
+function melToHz(mel) { return 700 * (10 ** (mel / 2595) - 1); }
+
+function melFilterBank(sampleRate, fftSize, filterCount = 26) {
+  const key = `${sampleRate}:${fftSize}:${filterCount}`;
+  if (acousticDspCache.has(key)) return acousticDspCache.get(key);
+  const minMel = hzToMel(80);
+  const maxMel = hzToMel(Math.min(7600, sampleRate / 2 - 100));
+  const points = Array.from({ length: filterCount + 2 }, (_, i) => minMel + (maxMel - minMel) * i / (filterCount + 1));
+  const bins = points.map((mel) => clamp(Math.floor((fftSize + 1) * melToHz(mel) / sampleRate), 0, fftSize / 2));
+  const filters = [];
+  for (let m = 1; m <= filterCount; m += 1) {
+    const filter = [];
+    const left = bins[m - 1];
+    const center = Math.max(left + 1, bins[m]);
+    const right = Math.max(center + 1, bins[m + 1]);
+    for (let k = left; k < center; k += 1) filter.push([k, (k - left) / Math.max(1, center - left)]);
+    for (let k = center; k <= right; k += 1) filter.push([k, (right - k) / Math.max(1, right - center)]);
+    filters.push(filter);
+  }
+  acousticDspCache.set(key, filters);
+  return filters;
+}
+
+function appendDeltaFeatures(staticFeatures) {
+  const frameCount = staticFeatures.length;
+  const dimension = staticFeatures[0]?.length || 0;
+  return staticFeatures.map((frame, index) => {
+    const delta = new Array(dimension).fill(0);
+    for (let d = 0; d < dimension; d += 1) {
+      const m2 = staticFeatures[Math.max(0, index - 2)][d];
+      const m1 = staticFeatures[Math.max(0, index - 1)][d];
+      const p1 = staticFeatures[Math.min(frameCount - 1, index + 1)][d];
+      const p2 = staticFeatures[Math.min(frameCount - 1, index + 2)][d];
+      delta[d] = (2 * (p2 - m2) + (p1 - m1)) / 10;
+    }
+    return [...frame, ...delta];
+  });
+}
+
+function normaliseFeatureColumns(features) {
+  if (!features.length) return features;
+  const dimension = features[0].length;
+  const means = new Float64Array(dimension);
+  const deviations = new Float64Array(dimension);
+  for (const frame of features) for (let d = 0; d < dimension; d += 1) means[d] += frame[d];
+  for (let d = 0; d < dimension; d += 1) means[d] /= features.length;
+  for (const frame of features) for (let d = 0; d < dimension; d += 1) deviations[d] += (frame[d] - means[d]) ** 2;
+  for (let d = 0; d < dimension; d += 1) deviations[d] = Math.sqrt(deviations[d] / features.length + 1e-4);
+  return features.map((frame) => frame.map((value, d) => (value - means[d]) / deviations[d]));
+}
+
+function extractAcousticFeatures(audioBuffer) {
+  const { samples, sampleRate } = prepareSpeechSamples(audioBuffer, 16000);
+  const frameSize = 400;
+  const hopSize = 160;
+  const fftSize = 512;
+  const filters = melFilterBank(sampleRate, fftSize, 26);
+  const staticFeatures = [];

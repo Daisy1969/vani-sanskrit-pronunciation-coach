@@ -1,0 +1,505 @@
+const { VOCABULARY, SURYA_SHAKTI_SEQUENCE, SOUND_GUIDE } = globalThis.__VANI_VOCABULARY_MODULE__;
+
+const STORAGE_KEY = 'vani-sanskrit-coach-v1';
+const DEFAULT_SETTINGS = {
+  engine: 'acoustic',
+  recognitionLanguage: 'en-IN',
+  voiceURI: '',
+  referenceVoiceGender: 'female',
+  rate: 0.82,
+  selectedLesson: 'Surya Shakti sequence',
+  microphoneDeviceId: '',
+  microphoneGain: 1.75,
+  playbackGain: 1.6,
+  referenceGain: 1.55,
+  voiceFocus: true,
+  voiceGateDb: 11,
+  voiceFocusVersion: 7,
+  acousticVersion: 7,
+  naturalVoiceVersion: 8,
+  earphoneMode: true
+};
+
+const els = Object.fromEntries(
+  [...document.querySelectorAll('[id]')].map((element) => [element.id, element])
+);
+
+const stored = loadStoredState();
+const migratedSettings = { ...DEFAULT_SETTINGS, ...(stored.settings || {}) };
+if (Number(stored.settings?.voiceFocusVersion || 0) < 7 || Number(stored.settings?.acousticVersion || 0) < 7) {
+  migratedSettings.voiceFocus = true;
+  migratedSettings.voiceFocusVersion = 7;
+  migratedSettings.acousticVersion = 7;
+  migratedSettings.engine = 'acoustic';
+  // Version 7 migrates older installations to direct acoustic scoring.
+  migratedSettings.recognitionLanguage = 'en-IN';
+  migratedSettings.microphoneGain = Math.min(Number(migratedSettings.microphoneGain) || 1.75, 2.25);
+}
+if (Number(stored.settings?.naturalVoiceVersion || 0) < 8) {
+  migratedSettings.referenceVoiceGender = ['male', 'female'].includes(stored.settings?.referenceVoiceGender)
+    ? stored.settings.referenceVoiceGender
+    : 'female';
+  migratedSettings.naturalVoiceVersion = 8;
+}
+const state = {
+  settings: migratedSettings,
+  progress: stored.progress || {},
+  activity: Array.isArray(stored.activity) ? stored.activity : [],
+  customWords: Array.isArray(stored.customWords) ? stored.customWords : [],
+  server: { sarvamEnabled: false, naturalVoices: null },
+  currentIndex: 0,
+  practiceWords: [],
+  sequenceIndex: Number.isInteger(stored.sequenceIndex) ? stored.sequenceIndex : 0,
+  voices: [],
+  deferredInstallPrompt: null,
+  recording: false,
+  preparingRecording: false,
+  recordingSession: 0,
+  testingMicrophone: false,
+  mediaRecorder: null,
+  mediaStream: null,
+  rawMediaStream: null,
+  mediaChunks: [],
+  audioContext: null,
+  audioSourceNode: null,
+  highPassNode: null,
+  lowPassNode: null,
+  microphoneGainNode: null,
+  compressorNode: null,
+  analyserNode: null,
+  voiceGateNode: null,
+  recordingDestination: null,
+  recognitionDestination: null,
+  processedAudioTrack: null,
+  levelAnimationFrame: null,
+  levelBuffer: null,
+  peakInputLevel: 0,
+  voiceDetected: false,
+  calibratingNoise: false,
+  noiseSamples: [],
+  noiseFloorRms: 0.003,
+  voiceGateThreshold: 0.012,
+  voiceGateOpen: false,
+  voiceCandidateSince: 0,
+  vadArmedAt: 0,
+  lastVoiceFrameAt: 0,
+  voiceStartedAt: 0,
+  silenceSince: 0,
+  autoStopRequested: false,
+  processedRecognition: false,
+  appliedAudioSettings: {},
+  recognition: null,
+  recognitionRestartCount: 0,
+  browserTranscript: '',
+  browserTranscriptRank: -1,
+  firstPhoneticTranscript: '',
+  firstPhoneticRank: -1,
+  recognitionHistory: [],
+  livePhoneticScore: 0,
+  speechOnsetDetected: false,
+  recognitionCompletion: null,
+  resolveRecognitionCompletion: null,
+  maxRecordingTimer: null,
+  microphoneTestTimer: null,
+  microphoneDevices: [],
+  currentAudioUrl: '',
+  playbackAudioContext: null,
+  playbackSourceNode: null,
+  playbackGainNode: null,
+  lastVoiceScan: null,
+  recordedAudioRecognitionSupported: null,
+  referenceAudioCache: new Map(),
+  referenceFeatureCache: new Map(),
+  referencePlaybackContext: null,
+  referencePlaybackSource: null
+};
+
+function loadStoredState() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function saveState() {
+  const data = {
+    settings: state.settings,
+    progress: state.progress,
+    activity: state.activity.slice(-500),
+    customWords: state.customWords,
+    sequenceIndex: state.sequenceIndex
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+}
+
+function allWords() {
+  return [...VOCABULARY, ...state.customWords];
+}
+
+function getWord(id) {
+  return allWords().find((word) => word.id === id);
+}
+
+function uniqueLessons() {
+  return [...new Set(allWords().map((word) => word.lesson))];
+}
+
+function escapeHtml(value = '') {
+  return String(value).replace(/[&<>'"]/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  }[character]));
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function showToast(message) {
+  els.toast.textContent = message;
+  els.toast.classList.add('show');
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => els.toast.classList.remove('show'), 3000);
+}
+
+function switchView(viewId) {
+  document.querySelectorAll('.view').forEach((view) => view.classList.toggle('active', view.id === viewId));
+  document.querySelectorAll('.nav-button').forEach((button) => button.classList.toggle('active', button.dataset.view === viewId));
+  history.replaceState(null, '', `#${viewId}`);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (viewId === 'library') renderLibrary();
+  if (viewId === 'progress') renderProgress();
+  if (viewId === 'settings') renderSettings();
+}
+
+function initNavigation() {
+  document.querySelectorAll('.nav-button').forEach((button) => {
+    button.addEventListener('click', () => switchView(button.dataset.view));
+  });
+  document.querySelectorAll('[data-go-settings]').forEach((button) => {
+    button.addEventListener('click', () => switchView('settings'));
+  });
+  const initialView = location.hash.slice(1);
+  if (document.getElementById(initialView)?.classList.contains('view')) switchView(initialView);
+}
+
+function populateLessonSelectors() {
+  const lessons = uniqueLessons();
+  const options = lessons.map((lesson) => `<option value="${escapeHtml(lesson)}">${escapeHtml(lesson)}</option>`).join('');
+  els.lessonSelect.innerHTML = options;
+  els.libraryLesson.innerHTML = `<option value="all">All lessons</option>${options}`;
+
+  if (!lessons.includes(state.settings.selectedLesson)) state.settings.selectedLesson = lessons[0];
+  els.lessonSelect.value = state.settings.selectedLesson;
+  resetPracticeWords(false);
+}
+
+function resetPracticeWords(randomize = false) {
+  const lesson = els.lessonSelect.value || state.settings.selectedLesson;
+  state.settings.selectedLesson = lesson;
+  state.practiceWords = allWords().filter((word) => word.lesson === lesson);
+  if (randomize) state.practiceWords.sort(() => Math.random() - 0.5);
+  state.currentIndex = Math.min(state.currentIndex, Math.max(0, state.practiceWords.length - 1));
+  saveState();
+  renderPracticeWord();
+}
+
+function currentWord() {
+  return state.practiceWords[state.currentIndex] || allWords()[0];
+}
+
+function renderPracticeWord() {
+  const word = currentWord();
+  if (!word) return;
+  const total = state.practiceWords.length;
+  els.wordCounter.textContent = `${word.lesson} • ${state.currentIndex + 1} of ${total}`;
+  els.wordDevanagari.textContent = word.devanagari || '—';
+  els.wordIast.textContent = word.iast || word.common;
+  els.wordCommon.textContent = word.common && word.common !== word.iast ? `Practice-sheet spelling: ${word.common}` : '';
+  els.wordMeaning.textContent = word.meaning || '';
+  els.syllableRow.innerHTML = word.syllables.map((part) => `<span class="syllable-chip">${escapeHtml(part)}</span>`).join('');
+  els.wordTip.textContent = word.tip || 'Listen, then repeat each syllable clearly.';
+  els.wordCounter.dataset.wordId = word.id;
+  resetFeedback();
+  updateNavigationButtons();
+}
+
+function resetFeedback() {
+  els.feedbackCard.className = 'feedback-card neutral';
+  els.scoreBadge.textContent = '—';
+  els.feedbackTitle.textContent = 'Your feedback will appear here';
+  els.heardText.textContent = 'Tap “Speak now” and say the word.';
+  els.focusFeedback.textContent = '';
+  els.playback.hidden = true;
+  els.recordStatus.textContent = 'Allow microphone access when asked.';
+}
+
+function updateNavigationButtons() {
+  els.previousButton.disabled = state.currentIndex <= 0;
+  els.nextButton.disabled = state.currentIndex >= state.practiceWords.length - 1;
+}
+
+function nextWord() {
+  if (state.currentIndex < state.practiceWords.length - 1) {
+    state.currentIndex += 1;
+    renderPracticeWord();
+  }
+}
+
+function previousWord() {
+  if (state.currentIndex > 0) {
+    state.currentIndex -= 1;
+    renderPracticeWord();
+  }
+}
+
+function chooseVoice() {
+  const requested = state.settings.voiceURI;
+  return state.voices.find((voice) => voice.voiceURI === requested)
+    || state.voices.find((voice) => /^sa[-_]/i.test(voice.lang))
+    || state.voices.find((voice) => /^hi[-_]/i.test(voice.lang))
+    || state.voices.find((voice) => /^mr[-_]|^ne[-_]/i.test(voice.lang))
+    || state.voices.find((voice) => /^en[-_](IN|GB)/i.test(voice.lang))
+    || state.voices[0];
+}
+
+function loadVoices() {
+  state.voices = window.speechSynthesis?.getVoices?.() || [];
+  const selected = chooseVoice();
+  els.voiceSelect.innerHTML = state.voices.map((voice) => {
+    const label = `${voice.name} — ${voice.lang}${voice.default ? ' (default)' : ''}`;
+    return `<option value="${escapeHtml(voice.voiceURI)}">${escapeHtml(label)}</option>`;
+  }).join('');
+  if (selected) {
+    els.voiceSelect.value = selected.voiceURI;
+    if (!state.settings.voiceURI) state.settings.voiceURI = selected.voiceURI;
+  } else {
+    els.voiceSelect.innerHTML = '<option>No system voices found</option>';
+  }
+}
+
+function referenceAudioUrl(word) {
+  if (!word || String(word.id || '').startsWith('custom-')) return '';
+  const gender = state.settings.referenceVoiceGender === 'male' ? 'male' : 'female';
+  return new URL(`audio/natural/${gender}/${encodeURIComponent(word.id)}.wav?v=8`, document.baseURI).href;
+}
+
+async function loadReferenceAudioBuffer(word) {
+  const url = referenceAudioUrl(word);
+  if (!url) return null;
+  if (state.referenceAudioCache.has(url)) return state.referenceAudioCache.get(url);
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return null;
+  const response = await fetch(url, { cache: 'force-cache' });
+  if (!response.ok) return null;
+  const context = new AudioContextClass();
+  try {
+    const buffer = await context.decodeAudioData(await response.arrayBuffer());
+    state.referenceAudioCache.set(url, buffer);
+    return buffer;
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+async function speakWord(word, slow = false) {
+  const buffer = await loadReferenceAudioBuffer(word).catch(() => null);
+  if (!buffer) {
+    if (word && !String(word.id || '').startsWith('custom-')) {
+      showToast('The selected natural Mac voice is unavailable. Open Settings and try the other voice.');
+      return;
+    }
+    // Custom words do not yet have a generated reference recording.
+    if (!('speechSynthesis' in window)) {
+      showToast('No reference recording is available for this word.');
+      return;
+    }
+    speechSynthesis.cancel();
+    const voice = chooseVoice();
+    const text = word.devanagari || word.iast || word.common;
+    const utterance = new SpeechSynthesisUtterance(text);
+    if (voice) { utterance.voice = voice; utterance.lang = voice.lang; }
+    utterance.rate = slow ? 0.62 : 0.82;
+    utterance.volume = 1;
+    speechSynthesis.speak(utterance);
+    showToast('Custom word: playback is available, but acoustic scoring needs a reference recording.');
+    return;
+  }
+
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return;
+  if (!state.referencePlaybackContext || state.referencePlaybackContext.state === 'closed') {
+    state.referencePlaybackContext = new AudioContextClass();
+  }
+  const context = state.referencePlaybackContext;
+  if (context.state === 'suspended') await context.resume();
+  try { state.referencePlaybackSource?.stop(); } catch { /* already stopped */ }
+  const source = context.createBufferSource();
+  const gain = context.createGain();
+  source.buffer = buffer;
+  const speed = clamp((Number(state.settings.rate) || 0.82) / 0.82 * (slow ? 0.70 : 1), 0.45, 1.25);
+  source.playbackRate.value = speed;
+  gain.gain.value = clamp(Number(state.settings.referenceGain) || 1.55, 0.5, 3);
+  source.connect(gain).connect(context.destination);
+  state.referencePlaybackSource = source;
+  source.start();
+}
+
+const independentVowels = {
+  'अ': 'a', 'आ': 'aa', 'इ': 'i', 'ई': 'ii', 'उ': 'u', 'ऊ': 'uu', 'ऋ': 'ri', 'ॠ': 'rii',
+  'ऌ': 'li', 'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au'
+};
+const consonants = {
+  'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'ng',
+  'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'ny',
+  'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+  'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+  'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+  'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v',
+  'श': 'sh', 'ष': 'sh', 'स': 's', 'ह': 'h', 'ळ': 'l'
+};
+const matras = {
+  'ा': 'aa', 'ि': 'i', 'ी': 'ii', 'ु': 'u', 'ू': 'uu', 'ृ': 'ri', 'ॄ': 'rii',
+  'ॢ': 'li', 'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au'
+};
+
+function devanagariToLatin(text) {
+  let result = '';
+  const chars = [...String(text || '')];
+  for (let i = 0; i < chars.length; i += 1) {
+    const char = chars[i];
+    if (independentVowels[char]) {
+      result += independentVowels[char];
+      continue;
+    }
+    if (consonants[char]) {
+      result += consonants[char];
+      const next = chars[i + 1];
+      if (next === '्') {
+        i += 1;
+      } else if (matras[next]) {
+        result += matras[next];
+        i += 1;
+      } else {
+        result += 'a';
+      }
+      continue;
+    }
+    if (char === 'ं' || char === 'ँ') result += 'm';
+    else if (char === 'ः') result += 'h';
+    else if (char === 'ऽ') result += '';
+    else if (char === 'ॐ') result += 'aum';
+    else if (char === '़' || char === '्') result += '';
+    else result += char;
+  }
+  return result;
+}
+
+function strictKey(value) {
+  return devanagariToLatin(value)
+    .replace(/ā/g, 'aa').replace(/ī/g, 'ii').replace(/ū/g, 'uu')
+    .replace(/[ṛṝ]/g, 'ri').replace(/[ḷḹ]/g, 'li')
+    .replace(/[śṣ]/g, 'sh').replace(/ṅ/g, 'ng').replace(/ñ/g, 'ny')
+    .replace(/[ṭ]/g, 't').replace(/[ḍ]/g, 'd').replace(/[ṇ]/g, 'n')
+    .replace(/[ṃṁ]/g, 'm').replace(/ḥ/g, 'h')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/w/g, 'v')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function lenientKey(value) {
+  return strictKey(value)
+    .replace(/aa/g, 'a').replace(/ii/g, 'i').replace(/uu/g, 'u')
+    .replace(/sh/g, 's').replace(/chh/g, 'ch')
+    .replace(/([kgcjtdpb])h/g, '$1')
+    .replace(/ng|ny/g, 'n');
+}
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  const current = new Array(b.length + 1);
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = Math.min(
+        current[j - 1] + 1,
+        previous[j] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+    for (let j = 0; j <= b.length; j += 1) previous[j] = current[j];
+  }
+  return previous[b.length];
+}
+
+function similarity(a, b) {
+  const maxLength = Math.max(a.length, b.length, 1);
+  return Math.max(0, 1 - levenshtein(a, b) / maxLength);
+}
+
+function phoneticTokens(value) {
+  const key = strictKey(value);
+  const tokens = key.match(/chh|sh|ch|th|dh|kh|gh|ph|bh|jh|ng|ny|aa|ii|uu|ai|au|[a-z0-9]/g);
+  return tokens || [];
+}
+
+function phoneticFamily(token) {
+  if (['a', 'aa', 'e', 'i', 'ii', 'o', 'u', 'uu', 'ai', 'au'].includes(token)) return 'vowel';
+  if (['s', 'sh', 'z'].includes(token)) return 's';
+  if (['t', 'th', 'd', 'dh'].includes(token)) return 't';
+  if (['k', 'kh', 'g', 'gh', 'q'].includes(token)) return 'k';
+  if (['p', 'ph', 'b', 'bh', 'f'].includes(token)) return 'p';
+  if (['c', 'ch', 'chh', 'j', 'jh'].includes(token)) return 'c';
+  if (['n', 'ng', 'ny', 'm'].includes(token)) return 'n';
+  if (['v', 'w'].includes(token)) return 'v';
+  if (['r', 'l'].includes(token)) return 'r';
+  return token;
+}
+
+function phoneticTokenMatch(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const familyA = phoneticFamily(a);
+  const familyB = phoneticFamily(b);
+  if (familyA !== familyB) return 0;
+  if (familyA === 'vowel') {
+    const longPairs = new Set(['a:aa', 'aa:a', 'i:ii', 'ii:i', 'u:uu', 'uu:u']);
+    return longPairs.has(`${a}:${b}`) ? 0.9 : 0.62;
+  }
+  return 0.72;
+}
+
+function firstPhoneticMatch(word, transcript) {
+  const heardTokens = phoneticTokens(transcript);
+  if (!heardTokens.length) return { matched: false, score: 0, compared: 0 };
+
+  const initialTargets = [
+    ...(word.syllables?.length ? [word.syllables[0]] : []),
+    word.common,
+    word.iast,
+    word.devanagari,
+    ...(word.accepted || [])
+  ].filter(Boolean);
+
+  let best = { matched: false, score: 0, compared: 0 };
+  for (const target of initialTargets) {
+    const targetTokens = phoneticTokens(target);
+    if (!targetTokens.length) continue;
+    const compareLength = Math.min(
+      heardTokens.length,
+      target === word.syllables?.[0] ? targetTokens.length : Math.min(targetTokens.length, 5)
+    );
+    if (!compareLength) continue;
+
+    let total = 0;
+    for (let index = 0; index < compareLength; index += 1) {
+      total += phoneticTokenMatch(heardTokens[index], targetTokens[index]);
+    }
+    const average = total / compareLength;
+    const firstSound = phoneticTokenMatch(heardTokens[0], targetTokens[0]);
+    const enoughSound = compareLength >= Math.min(2, targetTokens.length);
+    const matched = enoughSound && firstSound >= 0.62 && average >= 0.52;
+    const score = Math.round(average * 100);

@@ -1,0 +1,69 @@
+    state.settings.microphoneGain = Number(els.micGainSlider.value);
+    els.micGainOutput.value = `${state.settings.microphoneGain.toFixed(2)}×`;
+    if (state.microphoneGainNode) state.microphoneGainNode.gain.value = state.settings.microphoneGain;
+    saveState();
+  });
+  els.playbackGainSlider.addEventListener('input', () => {
+    state.settings.playbackGain = Number(els.playbackGainSlider.value);
+    els.playbackGainOutput.value = `${state.settings.playbackGain.toFixed(2)}×`;
+    if (state.playbackGainNode) state.playbackGainNode.gain.value = state.settings.playbackGain;
+    saveState();
+  });
+  els.earphoneMode.addEventListener('change', () => {
+    state.settings.voiceFocus = els.earphoneMode.checked;
+    state.settings.earphoneMode = els.earphoneMode.checked;
+    saveState();
+  });
+  els.voiceGateSlider.addEventListener('input', () => {
+    state.settings.voiceGateDb = Number(els.voiceGateSlider.value);
+    els.voiceGateOutput.value = `${state.settings.voiceGateDb} dB`;
+    const separation = Math.pow(10, state.settings.voiceGateDb / 20);
+    state.voiceGateThreshold = Math.max(0.009, state.noiseFloorRms * separation);
+    saveState();
+  });
+  els.testMicrophone.addEventListener('click', startMicrophoneTest);
+
+  if (navigator.mediaDevices?.addEventListener) {
+    navigator.mediaDevices.addEventListener('devicechange', () => refreshMicrophoneDevices(false));
+  }
+  window.addEventListener('beforeunload', cleanupAudioPipeline);
+
+  window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    state.deferredInstallPrompt = event;
+    els.installButton.hidden = false;
+  });
+  els.installButton.addEventListener('click', async () => {
+    if (!state.deferredInstallPrompt) return;
+    state.deferredInstallPrompt.prompt();
+    await state.deferredInstallPrompt.userChoice;
+    state.deferredInstallPrompt = null;
+    els.installButton.hidden = true;
+  });
+}
+
+function registerServiceWorker() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then((registration) => registration.update()).catch(() => {});
+  }
+}
+
+function init() {
+  initNavigation();
+  populateLessonSelectors();
+  initEvents();
+  renderStats();
+  renderSequence();
+  renderLibrary();
+  renderProgress();
+  renderSettings();
+  refreshMicrophoneDevices(false);
+  checkServerStatus();
+  registerServiceWorker();
+  if ('speechSynthesis' in window) {
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+  }
+}
+
+init();
